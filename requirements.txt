@@ -1,0 +1,5 @@
+# Progress 官网 manifest 使用 AES-GCM；复用成熟加密库，不自行实现密码算法。
+cryptography>=46,<47
+# 下面两个都是可选增强，缺了只会降级不会失败：
+#   lxml        仅 tools/parse_parity.py 用它做"新旧解析器逐字段等价"对比
+#   svgelements 仅 crop_logos.py 用它裁 logo 内边距；缺了图标会保留自带留白

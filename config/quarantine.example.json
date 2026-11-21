@@ -1,0 +1,19 @@
+{
+  "_comment": "仓库里这份是**种子/示例**，不是运行时清单：人筛过的记录写在 ~/Library/Application Support/ModelRadar/quarantine.json（mr_paths.QUARANTINE）。两段会并起来读，所以在这里只放字段说明与示例，正常为空数组。",
+  "_fields": {
+    "name": "档位全名，与 latest.json 的 models[].name 逐字相同（例：DeepSeek V4.1 Flash 1017 (non-reasoning)）",
+    "field": "要剥离的字段，取值见 fetch_model_data.QUARANTINE_FIELDS：tok_s / ttft_s / total_s / index / apt_usd / in_per_1m_usd / out_per_1m_usd / time_per_task_s",
+    "from_ts": "区间起点，用台账 snapshots/series 里的 ts（北京时间），含端点；空字符串=不限下限",
+    "to_ts": "区间终点，含端点；空字符串=不限上限",
+    "reason": "为什么判它不可信。写给三个月后的自己看，要能独立复算",
+    "source": "哪个源给的（aa / openrouter / datalearner / aa_times），只作留痕",
+    "checked_at": "人工筛查的时间"
+  },
+  "_rules": [
+    "必须给 from_ts/to_ts 区间：只写模型名会把之后正常的数据一起屏蔽，比不隔离更糟。",
+    "剥离只影响比较与派生（涨跌、门槛、推估、前沿），不改写原始记录；历史序列仍按原始值入库。",
+    "每次剥离都追加到 ~/Library/Logs/ModelRadar/faults.jsonl，可据此回看当时收到了什么。",
+    "隔离不等于归因：清掉告警后仍应查上游为什么给出这个值。"
+  ],
+  "quarantined": []
+}

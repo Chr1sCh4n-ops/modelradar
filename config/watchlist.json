@@ -1,0 +1,29 @@
+{
+  "_comment": "仓库里这份是**种子**，不是运行时的词表：爬虫每轮改写的是 ~/Library/Application Support/ModelRadar/config/watchlist.json（mr_paths.CONFIG；首次不存在时整份抄这里，所以攒下来的词一条不丢）。放在状态目录是因为它每轮都被写： 安装副本的 src/config/watchlist.json 与仓库这份曾是同一个 inode，定时任务于是每天往 git 工作树里改一次，看起来像「有人改了配置没提交」（实测 10-17 加 claude、10-20 加 minimax 各脏一次）。关键词由 fetch_model_data.derive_watchlist() 按 AA 前 50 名派生（名次线由 watchlist_boundary 定：历史关注厂商掉出基础 50 名后按它当前最高名次扩边，取该厂商最好那一行，避免同厂低档把整条线拖到榜尾）：每次抓取跑增量（grow_watchlist，只加不减，新家族当轮生效），整表重算与删词只有 --refresh-watchlist。匹配按整词边界（norm_runs/runs_hit）：'sol' 不再捞 'Solar'、'ling' 不再捞 'Inkling'、'v4' 不再顺带捞 'V4.1'；写错的词会零命中并在 script.log 报出来。厂商色由 vendor_colors.derive() 按各家 logo SVG 派生。两张表都不手工维护：keyword_include_pinned（掉出前 50 仍要盯的词）、keyword_exclude（要压制的词）与 vendor_brand_color_override（确认派生错了才用）这三段是**人写的**，每次读取都从本文件并进去（load_config），改了下一轮就生效，不必去动状态目录；keyword_include 在这里只当首次的起点用。",
+  "keyword_include": [
+    "astra",
+    "claude",
+    "deepseek",
+    "fable",
+    "gemini",
+    "glm",
+    "grok",
+    "haiku",
+    "kimi",
+    "ling",
+    "luna",
+    "mimo",
+    "minimax",
+    "mistral",
+    "muse",
+    "opus",
+    "qwen3.8",
+    "sol",
+    "sonnet",
+    "step",
+    "terra"
+  ],
+  "keyword_exclude": [],
+  "keyword_include_pinned": [],
+  "vendor_brand_color_override": {}
+}

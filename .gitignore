@@ -1,0 +1,8 @@
+.state/
+.venv/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+data/latest.json
+data/logos_raw/

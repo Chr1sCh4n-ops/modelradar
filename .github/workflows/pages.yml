@@ -1,0 +1,65 @@
+name: Deploy ModelRadar Window
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      MODELRADAR_SUPPORT: ${{ github.workspace }}/.state
+      MODELRADAR_DATA_DIR: ${{ github.workspace }}/.state/data
+      MODELRADAR_REPO_DATA: ${{ github.workspace }}/data
+      MR_FETCH_PROXY: "off"
+      MODELRADAR_NO_SUMMARY: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/python -m pip install --quiet -r requirements.txt
+
+      - name: Refresh public data
+        continue-on-error: true
+        run: |
+          .venv/bin/python fetch_model_data.py \
+            --sources aa,aa_progress,aa_times,openrouter,models_dev,datalearner,openrouter_usage
+          .venv/bin/python render_scatter_svg.py -o data/chart.html
+
+      - name: Assemble Pages artifact
+        run: |
+          mkdir -p public/data
+          cp index.html public/index.html
+          cp data/chart.html public/data/chart.html
+          cp data/latest.js public/data/latest.js
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
