@@ -66,8 +66,9 @@
   }
   .tools button{
     font:12px/1 inherit; padding:5px 9px; border-radius:6px; border:1px solid var(--line);
-    background:transparent; color:var(--dim); cursor:not-allowed; white-space:nowrap;
+    background:transparent; color:var(--ink); cursor:pointer; white-space:nowrap;
   }
+  .tools button[aria-pressed="true"]{background:rgba(127,127,127,.22)}
   .tools .note{margin-left:auto; font-size:11px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .tools .note a{color:inherit; text-underline-offset:2px}
   .closed-tip{
@@ -104,6 +105,7 @@
 <div class="pop" id="pop" role="dialog" aria-label="ModelRadar 弹层">
   <div class="stage" id="stage"><iframe id="frame" title="ModelRadar 定位图" src="data/chart.html"></iframe></div>
   <div class="tools" id="tools">
+    <button type="button" id="cards" aria-pressed="true">▤ 卡片</button>
     <span id="changes" aria-live="polite">正在读取数据…</span>
     <span class="note">网页仿制 · 本地动作仅在 macOS 应用里可用 · <a href="data/chart.html">原件</a></span>
   </div>
@@ -121,6 +123,26 @@
       dot = document.getElementById('dot'),
       tip = document.getElementById('tip'),
       clock = document.getElementById('clock');
+
+  var cards = document.getElementById('cards'), cardsOn = true;
+  try { cardsOn = localStorage.getItem('mr.cardsOn') !== '0'; } catch (err) {}
+  function applyCards(){
+    cards.setAttribute('aria-pressed', String(cardsOn));
+    try {
+      var win = frame.contentWindow, doc = frame.contentDocument;
+      win.MR_CARDS = cardsOn ? 1 : 0;
+      if (!cardsOn) doc.querySelectorAll('.chip.hi').forEach(function(ch){ ch.classList.remove('hi'); });
+      var svg = doc.querySelector('#scatterwrap svg') || doc.querySelector('svg');
+      if (cardsOn && svg && svg.__mrRelayout) svg.__mrRelayout();
+    } catch (err) {}
+  }
+  cards.addEventListener('click', function(){
+    cardsOn = !cardsOn;
+    try { localStorage.setItem('mr.cardsOn', cardsOn ? '1' : '0'); } catch (err) {}
+    applyCards();
+  });
+  frame.addEventListener('load', applyCards);
+  applyCards();
 
   var NAT_W = 748, TOP = 34, GAP = 12;
 
