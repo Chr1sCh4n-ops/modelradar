@@ -39,10 +39,10 @@ jobs:
           .venv/bin/python -m pip install --quiet -r requirements.txt
 
       - name: Refresh public data
-        continue-on-error: true
         run: |
           .venv/bin/python fetch_model_data.py \
             --sources aa,aa_progress,aa_times,openrouter,models_dev,datalearner,openrouter_usage
+          .venv/bin/python -c 'import json, os; d=json.load(open(os.path.join(os.environ["MODELRADAR_DATA_DIR"], "latest.json"))); assert d.get("data_state") == "ok" and d.get("models"), "Fresh complete data is required"'
           .venv/bin/python render_scatter_svg.py -o data/chart.html
 
       - name: Assemble Pages artifact
@@ -51,6 +51,7 @@ jobs:
           cp index.html public/index.html
           cp data/chart.html public/data/chart.html
           cp data/latest.js public/data/latest.js
+          cp "$MODELRADAR_DATA_DIR/latest.json" public/data/latest.json
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

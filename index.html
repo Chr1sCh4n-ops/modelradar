@@ -104,10 +104,7 @@
 <div class="pop" id="pop" role="dialog" aria-label="ModelRadar 弹层">
   <div class="stage" id="stage"><iframe id="frame" title="ModelRadar 定位图" src="data/chart.html"></iframe></div>
   <div class="tools" id="tools">
-    <button type="button" disabled title="网页仿制不执行本地动作">⟳ 重新生成</button>
-    <button type="button" disabled title="网页仿制不执行本地动作">↻ 立即抓取</button>
-    <button type="button" disabled title="网页仿制不执行本地动作">▤ 卡片</button>
-    <button type="button" disabled title="网页仿制不执行本地动作">⋯</button>
+    <span id="changes" aria-live="polite">正在读取数据…</span>
     <span class="note">网页仿制 · 本地动作仅在 macOS 应用里可用 · <a href="data/chart.html">原件</a></span>
   </div>
 </div>
@@ -171,7 +168,9 @@
     tip.hidden = true;
     dot.classList.remove('on');     // 点开即视为已读，消掉角标（与外壳一致）
     layout();
-    markSeen(currentStamp);
+    if (currentSnapshot) {
+      showSnapshot(currentSnapshot);
+    }
   }
   function close(){
     pop.classList.remove('open');
@@ -192,26 +191,64 @@
   setInterval(function(){ if (pop.classList.contains('open')) layout(); }, 1500);  // 换图后高度会变
 
   // 角标只在“有比上次看过的更新”时亮，和外壳语义一致；没证据就不亮。
-  var seenKey = 'mr.seen.generated_at', currentStamp = null;
-  function markSeen(ts){
-    try { if (ts) localStorage.setItem(seenKey, ts); } catch (err) {}
+  var seenKey = 'mr.seen.snapshot.v1', currentSnapshot = null;
+  var changes = document.getElementById('changes');
+  function markSeen(snapshot){
+    try { if (snapshot) localStorage.setItem(seenKey, JSON.stringify(snapshot)); }
+    catch (err) { changes.textContent = '浏览器存储不可用，无法保存上次查看记录'; }
+  }
+  function showSnapshot(snapshot){
+    frame.onload = function(){
+      layout();
+      try {
+        var stamp = frame.contentDocument.querySelector('.foot .tip b');
+        if (currentSnapshot === snapshot && pop.classList.contains('open') &&
+            stamp && stamp.textContent.trim() === snapshot.last) markSeen(snapshot);
+        else changes.textContent = '图表和数据时间不一致，未更新查看记录';
+      } catch (err) { changes.textContent = '无法验证图表，未更新查看记录'; }
+    };
+    frame.src = 'data/chart.html?v=' + encodeURIComponent(snapshot.last);
   }
   function checkUnread(){
     fetch('data/latest.json', {cache:'no-store'}).then(function(r){
       return r.ok ? r.json() : null;
     }).then(function(d){
-      var ts = d && d.generated_at;
-      if (!ts) return;
-      currentStamp = ts;
-      if (pop.classList.contains('open')) { markSeen(ts); return; }
-      var seen = null;
-      try { seen = localStorage.getItem(seenKey); } catch (err) {}
-      if (seen && Date.parse(ts.replace(' ','T')) <= Date.parse(seen.replace(' ','T'))) return;
-      dot.classList.add('on');
-    }).catch(function(){});
+      if (!d || !d.generated_at || d.data_state !== 'ok' || !Array.isArray(d.models) || !d.models.length) {
+        changes.textContent = '暂无可比较的新鲜数据'; return;
+      }
+      if (currentSnapshot && currentSnapshot.last === d.generated_at) return;
+      if (!d.content_hash) { changes.textContent = '数据缺少内容指纹，无法比较'; return; }
+      var snapshot = {first:d.generated_at, last:d.generated_at, hash:d.content_hash, version:d.evaluation_version, models:{}};
+      d.models.forEach(function(m){
+        if (m.name) snapshot.models[m.name] = {index:m.index, apt_usd:m.apt_usd};
+      });
+      var seen;
+      try { seen = JSON.parse(localStorage.getItem(seenKey) || 'null'); }
+      catch (err) { changes.textContent = '浏览器存储不可用，无法保存上次查看记录'; return; }
+      var same = seen && seen.hash === snapshot.hash;
+      if (same) snapshot.first = seen.first || seen.last;
+      currentSnapshot = snapshot;
+      if (!seen || !seen.models) changes.textContent = '首次查看：已建立本浏览器的对比基准';
+      else if (same) changes.textContent = '相同快照：' + snapshot.first + ' 至 ' + snapshot.last;
+      else if (!seen.version || !snapshot.version || seen.version !== snapshot.version)
+        changes.textContent = '评测版本不同或未知，不比较指标';
+      else {
+        var changed = Object.keys(snapshot.models).filter(function(name){
+          var a = seen.models[name], b = snapshot.models[name];
+          return a && ['index','apt_usd'].some(function(k){
+            return typeof a[k] === 'number' && typeof b[k] === 'number' && a[k] !== b[k];
+          });
+        });
+        changes.textContent = '自上次查看 ' + seen.last + '：' + changed.length + ' 个模型指标变化';
+      }
+      if (pop.classList.contains('open')) {
+        showSnapshot(snapshot);
+      } else if (seen && !same) dot.classList.add('on');
+    }).catch(function(){ changes.textContent = '无法读取最新数据'; });
   }
 
   checkUnread();
+  setInterval(checkUnread, 60000);
   open();                            // 本页目的就是看这个弹层，进来先展开
 })();
 </script>

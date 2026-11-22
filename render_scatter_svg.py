@@ -596,10 +596,13 @@ SIZE_JS = """(function(){
   // 初值来自宿主：状态栏在 documentStart 注入 window.MR_SIZE_TASK / MR_SIZE_PENALTY。
   // 这里只恢复 UI 与几何，不回写偏好 —— 初始化不能触发保存，否则每次重载都会把
   // 刚读到的东西再写一遍，和用户真正的选择混成一个事件环。
-  var wantTask = typeof window !== 'undefined'
-    && (window.MR_SIZE_TASK === 1 || window.MR_SIZE_TASK === '1');
-  var wantPen = typeof window !== 'undefined'
-    && (window.MR_SIZE_PENALTY === 1 || window.MR_SIZE_PENALTY === '1');
+  function browserPreference(key) {
+    try { return localStorage.getItem(key) === '1'; } catch (e) { return false; }
+  }
+  var wantTask = typeof window.MR_SIZE_TASK !== 'undefined'
+    ? (window.MR_SIZE_TASK === 1 || window.MR_SIZE_TASK === '1') : browserPreference('mrSizeTask');
+  var wantPen = typeof window.MR_SIZE_PENALTY !== 'undefined'
+    ? (window.MR_SIZE_PENALTY === 1 || window.MR_SIZE_PENALTY === '1') : browserPreference('mrSizePenalty');
   if (penBox) { penBox.checked = wantPen; penBox.disabled = !penReady; }
   box.checked = wantTask;
   apply(wantTask);
@@ -609,6 +612,8 @@ SIZE_JS = """(function(){
       if (window.webkit && window.webkit.messageHandlers
           && window.webkit.messageHandlers[name]) {
         window.webkit.messageHandlers[name].postMessage(value ? 1 : 0);
+      } else {
+        localStorage.setItem(name, value ? '1' : '0');
       }
     } catch (e) {}
   }

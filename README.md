@@ -14,9 +14,11 @@ The repository does not include the macOS app, LaunchAgents, installers, full da
 
 ## GitHub Pages
 
-The workflow runs on every push to `main` and once each day. It fetches public model data, renders `data/chart.html`, and deploys the window page to GitHub Pages.
+The workflow runs on pushes to `main` and on a five-minute schedule. GitHub can delay or skip scheduled runs. It fetches public model data, renders `data/chart.html`, and deploys the window page to GitHub Pages.
 
-If a scheduled fetch fails, the workflow still deploys the last committed chart snapshot.
+If a fetch fails or returns incomplete data, the deployment fails and the published page stays unchanged.
+
+Each browser stores its own last viewed snapshot and display settings in local storage. Identical snapshots share one record with first and latest fetch times. Clearing browser data removes this history.
 
 The page uses these public sources:
 
