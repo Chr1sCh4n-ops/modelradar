@@ -14,7 +14,7 @@ The repository does not include the macOS app, LaunchAgents, installers, full da
 
 ## GitHub Pages
 
-The workflow runs on pushes to `main` and on a five-minute schedule. GitHub can delay or skip scheduled runs. It fetches public model data, renders `data/chart.html`, and deploys the window page to GitHub Pages.
+The workflow runs on pushes to `main` and on a six-minute schedule. GitHub can delay or skip scheduled runs. It fetches public model data, renders `data/chart.html`, and deploys the window page to GitHub Pages.
 
 If a fetch fails or returns incomplete data, the deployment fails and the published page stays unchanged.
 
