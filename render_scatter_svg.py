@@ -26,6 +26,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import html
 import json
 import math
+import re
 import os
 import sys
 from pathlib import Path
@@ -314,6 +315,7 @@ HOVER_JS = """(function(){
     // data-c = 整个厂商（悬停图例格时）。图例格只有 data-c，气泡两个都有 ——
     // 所以落点在气泡上就必然走族，不会被厂商组盖掉。
     var hits = [].slice.call(svg.querySelectorAll('[' + a + '="' + esc(k) + '"]'));
+    if (a === 'data-k') hits = hits.concat([].slice.call(svg.querySelectorAll('[data-history-for="' + esc(k) + '"]')));
     hits.forEach(remember);
     hits.forEach(function(el){
       if (el.classList.contains('chip')) { chips.push(el); cards.appendChild(el); }
@@ -1171,14 +1173,14 @@ def family_center(ps: list[dict], px, py) -> tuple[float, float, float, float, f
             mid.get("r_task_pen", rt))
 
 
-def layout_family_card(ps: list[dict], px, py) -> dict:
+def layout_family_card(ps: list[dict], px, py, lines=None) -> dict:
     """一张族卡：贴在**中心点的左上角**（卡的右下角对着那颗球），一律这样、不按左右侧翻转。
 
     越界靠夹紧兜住：贴出去会出画时宁可压住自己的球，也不换到另一侧去
     —— 换侧就等于"卡片离小球太远"，读者认不出这张卡说的是哪一族。
     """
     cx, cy, rr, rrt, rrp = family_center(ps, px, py)
-    box = chip_box(cx, cy, rr, family_card_lines(ps))
+    box = chip_box(cx, cy, rr, family_card_lines(ps) if lines is None else lines)
     w, h = box["w"], box["h"]
     x = min(cx - rr - CHIP_GAP - w, W - PR - 2 - w)
     y = min(cy - rr - CHIP_GAP - h, H - PB - 2 - h)
@@ -1383,15 +1385,6 @@ def legend_counts(cols: list[int], n: int) -> list[int]:
     return counts + [0] * (len(cols) - k)
 
 
-# 图上直接标名字的点（其余靠 hover tooltip）
-NOTES = {
-    "Claude Opus 5.5 (max with fallback)": "Opus 5.5 max",
-    "MiMo-V2.6-Pro": "MiMo Pro",
-    "GPT-6 Luna (low)": "Luna low",
-    "DeepSeek V4.1 Flash (max)": "DS Flash",
-}
-
-
 def load_points() -> tuple[list[dict], list[dict], list[str]]:
     D = json.loads(LATEST.read_text())
     ms = [m for m in D.get("models", []) if m.get("index") is not None and m.get("apt_usd")]
@@ -1476,9 +1469,121 @@ def load_points() -> tuple[list[dict], list[dict], list[str]]:
     return pts, front, order
 
 
+def frontier_notes(points, px, py):
+    """给前沿上**同一代次只标它在前沿上的最高档**，撞车时先退档、再沿相对方向外移画引线。
+
+    以前这里写死四个模型名，榜单改名或换代后标签就静默消失（实测只剩两个）。
+    资格直接取当前前沿成员，不再按名字维护白名单。
+    """
+    groups = {}
+    for p in points:
+        groups.setdefault(p["k"], []).append(p)
+    for group in groups.values():
+        group.sort(key=lambda p: (tier_rank(p.get("t")), p["y"], -p["x"]), reverse=True)
+    placed = []
+    for group in sorted(groups.values(), key=lambda g: (-g[0]["y"], -g[0]["x"], g[0]["n"])):
+        def at(p, angle=math.pi / 2, extra=0):
+            x, y = px(p["x"]), py(p["y"])
+            u, v = math.cos(angle), math.sin(angle)
+            w, h = len(p["n"]) * 3.2 + 3, 7
+            r = p["r"]
+            extent = min(w / max(abs(u), 1e-9), h / max(abs(v), 1e-9))
+            a, b = x + u * (r + 2 + extent + extra), y + v * (r + 2 + extent + extra)
+            return p, a, b, w, h, (x + u * r, y + v * r, a - u * extent, b - v * extent)
+
+        def overlaps(a, b):
+            return abs(a[1] - b[1]) < a[3] + b[3] and abs(a[2] - b[2]) < a[4] + b[4]
+
+        def fits(note):
+            _, x, y, w, h, _ = note
+            return (4 <= x - w and x + w <= W - 4 and PT <= y - h and y + h <= H - PB
+                    and not any(overlaps(note, other) for other in placed))
+
+        default = at(group[0])
+        if fits(default):
+            placed.append(default)
+            continue
+        blocker_index = next((i for i, other in enumerate(placed) if overlaps(default, other)), None)
+        if blocker_index is not None and len(group) > 1 and fits(lower := at(group[1])):
+            placed.append(lower)
+            continue
+        p = group[0]
+        x, y = px(p["x"]), py(p["y"])
+        blocker = placed[blocker_index][0] if blocker_index is not None else None
+        direction = (math.atan2(y - py(blocker["y"]), x - px(blocker["x"]))
+                     if blocker is not None else math.atan2(H / 2 - y, W / 2 - x))
+        steps = (0, 8, 16, 28, 44, 64, 90, 120)
+        if blocker is not None:
+            previous = placed.pop(blocker_index)
+            for step in steps:
+                left, right = at(blocker, direction + math.pi, step), at(p, direction, step)
+                if fits(left) and fits(right) and not overlaps(left, right):
+                    placed.insert(blocker_index, left)
+                    placed.append(right)
+                    break
+            else:
+                placed.insert(blocker_index, previous)
+            if placed[-1][0] is p:
+                continue
+        candidate = next((note for turn in (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6)
+                          for step in steps
+                          if fits(note := at(p, direction + turn * math.pi / 6, step))), None)
+        if candidate is not None:
+            placed.append(candidate)
+    return placed
+
+
+def history_successors(groups):
+    products = {}
+    for k, points in groups.items():
+        p = points[0]
+        name = p["s"].casefold()
+        match = re.search(r"(?<![a-z\d])(\d+(?:\.\d+)*)(?![a-z\d])", name)
+        if not match or ("." not in match[1] and len(match[1]) > 2):
+            continue
+        product = name[:match.start()] + "#" + name[match.end():]
+        version = tuple(map(int, match[1].split(".")))
+        key = p["c"], product, version[0]
+        products.setdefault(key, []).append((version + (0,) * (3 - len(version)), k))
+    links = {}
+    for releases in products.values():
+        previous = None
+        for version, k in sorted(releases):
+            if not all(p.get("carry") for p in groups[k]):
+                if previous and previous[0] < version:
+                    links[previous[1]] = k
+                previous = None
+            else:
+                previous = (version, k)
+    return links
+
+
+def history_comparison(old, current):
+    dates = sorted({p["carry"] for p in old})
+    date = dates[0] if len(dates) == 1 else f'{dates[0]} 至 {dates[-1]}'
+    lines = [f'旧版 {old[0]["s"]} · 沿用 {date}', f'新版 {current[0]["s"]} · 同档变化中位']
+    pairs = []
+    for p in old:
+        key = p.get("t"), p.get("iv")
+        matches = [q for q in current if (q.get("t"), q.get("iv")) == key and not q.get("carry")]
+        if key[1] and len(matches) == 1 and sum((q.get("t"), q.get("iv")) == key for q in old) == 1:
+            pairs.append((p, matches[0]))
+    for key, label in (("y", "智能指数"), ("x", "每任务成本"), ("v", "TPS"), ("tp", "任务耗时(估)")):
+        values = [(a[key], b[key]) for a, b in pairs
+                  if a.get(key) is not None and b.get(key) is not None and (key == "y" or a[key] > 0)]
+        if not values:
+            continue
+        delta = median([b - a for a, b in values]) if key == "y" else median([(b/a - 1) * 100 for a, b in values])
+        old_mid, new_mid = (median([p[i] for p in values]) for i in (0, 1))
+        change = f'{delta:+g} 分' if key == "y" else f'{delta:+.1f}%'
+        fmt = time_cell if key == "tp" else speed_text if key == "v" else lambda v: f'{v:g}'
+        lines.append(f'{label} {fmt(old_mid)} → {fmt(new_mid)} · {change}（{len(values)} 档）')
+    return lines if len(lines) > 2 else lines + ['无可比较的同档读数']
+
+
 def build_svg(pts: list[dict], front: list[dict], order: list[str],
               unplotted: dict[str, list[dict]] | None = None,
-              penalty: dict | None = None) -> str:
+              penalty: dict | None = None, history=None) -> str:
     if not pts:
         # 空数据是合法状态（AA 全挂且无快照时 latest.json 的 models 可以为 []）。
         # 宁可画一张写明原因的空图，也不能在下面的 min()/max() 上崩 —— 一崩，
@@ -1489,6 +1594,23 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
     # 任务耗时模式的半径依赖**当前图上**的正耗时范围，必须在画点前一次算好：
     # 默认 TPS 半径 r 保持原样，只新增 r_task/task_missing 两个展示字段。
     apply_task_radii(pts, penalty)
+    by_s = {}
+    for p in pts:
+        by_s.setdefault(p["k"], []).append(p)
+    history = history_successors(by_s) if history is None else history
+    active = [p for p in pts if p["k"] not in history]
+    if history:
+        front = []
+        for p in sorted(active, key=lambda p: (p["x"], -p["y"], p["n"])):
+            if not (p.get("est") or p.get("band")) and (not front or p["y"] > front[-1]["y"]):
+                front.append(p)
+        front_ids = {id(p) for p in front}
+        active = [dict(p, f=id(p) in front_ids) for p in active]
+
+    def hover_attr(k, c):
+        if k in history:
+            return f'data-history-for="{html.escape(history[k], quote=True)}"'
+        return f'data-c="{c}"'
     x0, x1 = math.log10(min(p["x"] for p in pts)), math.log10(max(p["x"] for p in pts))
     y0, y1 = min(p["y"] for p in pts), max(p["y"] for p in pts)
     # 单点 / 全部点同成本时 span 为 0，px/py 的除法会 ZeroDivisionError：先撑开一度。
@@ -1510,6 +1632,8 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
         f'<svg viewBox="0 0 {W} {H}" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" '
         f'data-plot="{PL} {PT} {W - PR} {H - PB}" '
         f'data-task-pen="{1 if task_size.penalty_ready(penalty) else 0}">',
+        '<style>[data-history-for]:not(.hi){display:none}'
+        '.mk.carr[data-history-for].hi,.ln[data-history-for].hi{opacity:.45;pointer-events:none}</style>',
         "<title>速度与成本性价比定位图</title>",
         "<desc>横轴为每任务成本（对数），纵轴为智能指数，气泡面积默认表示输出速度（可切换为任务耗时），"
         "同色细折线是同族同代次按推理档位固定顺序串起来的能力线"
@@ -1539,16 +1663,13 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
 
     # 按推理投入连线，保留加大推理后分数反而下降的真实折返。
     # 画在气泡**下面**且不描虚线，避免和 Pareto 前沿（唯一的虚线）混起来。
-    by_s: dict[str, list[dict]] = {}
-    for p in pts:
-        by_s.setdefault(p["k"], []).append(p)
     for k in sorted(by_s):
         g = by_s[k]
         if len(g) < 2:
             continue
         g.sort(key=lambda z: (tier_rank(z.get("t")), z["y"], z["x"]))
         sp = " ".join(f"{px(z['x']):.1f},{py(z['y']):.1f}" for z in g)
-        o.append(f'<polyline class="ln" data-k="{html.escape(g[0]["k"], quote=True)}" data-c="{g[0]["c_esc"]}" points="{sp}" fill="none" '
+        o.append(f'<polyline class="ln" data-k="{html.escape(k, quote=True)}" {hover_attr(k, g[0]["c_esc"])} points="{sp}" fill="none" '
                  f'stroke="{g[0]["col"]}" stroke-width="1.1" stroke-opacity=".5" stroke-linejoin="round"/>')
 
     fp = " ".join(f"{px(p['x']):.1f},{py(p['y']):.1f}" for p in front)
@@ -1556,13 +1677,6 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
              f'stroke-dasharray="5 4" stroke-opacity=".85" stroke-linejoin="round"/>')
 
     # 提示卡的位置要在画点之前就定好：卡片是**静态标记**，JS 只切 .hi
-    by_v: dict[str, list[dict]] = {}
-    for p in pts:
-        by_v.setdefault(p["c"], []).append(p)
-    by_k: dict[str, list[dict]] = {}
-    for p in pts:
-        by_k.setdefault(p["k"], []).append(p)
-
     for i, p in enumerate(pts):
         # 每个点包一层 <g class="mk" data-k>：悬停高亮要按族整组抬起来，
         # 而 SVG 的层序就是文档序 —— 光靠 CSS 抬不动被压住的点，必须能整组搬。
@@ -1592,7 +1706,7 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
         pair = task_pair(p)
         tp_band_attr = f' data-tp-band="{pair[0]:g} {pair[1]:g}"' if pair else ""
         g = [f'<g class="{cls}" data-k="{html.escape(p["k"], quote=True)}" '
-             f'data-c="{p["c_esc"]}" data-i="{i}" data-n="{html.escape(p["n"], quote=True)}" '
+             f'{hover_attr(p["k"], p["c_esc"])} data-i="{i}" data-n="{html.escape(p["n"], quote=True)}" '
              f'data-cx="{px(p["x"]):.1f}" data-cy="{py(p["y"]):.1f}" '
              f'data-r="{p["r"]:.1f}" data-r-task="{p["r_task"]:.1f}"{pen_attr}'
              f' data-tp="{tp_attr}"{tp_est_attr}{tp_band_attr}{missing_attr}{est_attr}'
@@ -1616,8 +1730,9 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
     # .chip 必须 pointer-events:none —— 卡片若吃指针，事件的 target 就变成卡片自己，
     # closest('[data-k]') 落空走延迟收起，又回到 2026-09-29 那种"自己触发自己"的抖动。
     fams = []
-    for k, ps in by_k.items():
-        box = layout_family_card(ps, px, py)
+    for k, ps in by_s.items():
+        successor = history.get(k)
+        box = layout_family_card(ps, px, py, history_comparison(ps, by_s[successor]) if successor else None)
         fams.append((ps[0]["c"], -max(p["y"] for p in ps), k, box, ps))
     fam_by_vendor: dict[str, list[dict]] = {}
     for i, (v, _ny, k, box, ps) in enumerate(sorted(fams, key=lambda z: (z[0], z[1], z[2]))):
@@ -1628,27 +1743,30 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
         box["keys"] = {"k": k, "c": v, "pri": box["pri"],
                        "ball": '%.1f %.1f %.1f' % box["ball"],
                        "ball-task": '%.1f %.1f %.1f' % box["ball_task"],
-                       "ball-task-pen": '%.1f %.1f %.1f' % box["ball_task_pen"]}
+                        "ball-task-pen": '%.1f %.1f %.1f' % box["ball_task_pen"]}
+        if k in history:
+            del box["keys"]["c"]
+            box["keys"]["history-for"] = history[k]
     for v in sorted(fam_by_vendor):
         for box in fam_by_vendor[v]:
             o.append(chip_svg(box, "fam", box["keys"]))
 
-    for i, p in enumerate(pts):
-        if p["n"] in NOTES:
-            o.append(f'<text data-note-for="{i}" x="{px(p["x"]):.1f}" '
-                     f'y="{py(p["y"])+p["r"]+12:.1f}" text-anchor="middle" '
-                     f'font-size="11" fill="{INK}" fill-opacity=".9">{NOTES[p["n"]]}</text>')
+    for p, x, y, _w, _h, (x1, y1, x2, y2) in frontier_notes(front, px, py):
+        o.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                 f'stroke="{p["col"]}" stroke-opacity=".65" pointer-events="none"/>')
+        o.append(f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="middle" dominant-baseline="central" '
+                 f'font-size="10" fill="{INK}" pointer-events="none">{html.escape(p["n"])}</text>')
 
     o.append(f'<text x="{PL}" y="{PT-8}" font-size="11" fill="{DIM}">智能指数 ↑</text>')
     o.append(f'<text x="{W-PR}" y="{H-10}" text-anchor="end" font-size="11" fill="{DIM}">每任务成本 →（对数）</text>')
     o.append(f'<text x="{W-PR}" y="{PT+10}" text-anchor="end" font-size="11" fill="{FRONT}">Pareto 前沿</text>')
 
-    rows = legend_rows(pts, order)
+    rows = legend_rows(active, order)
     # 三种大小模式里取**最大**半径让位：任务耗时与低分收缩的半径由 SIZE_JS 在运行时换上，
     # 图例是静态的、切换时不重排；按 TPS 半径算就会在切过去之后被大球压住。
     obstacles = [(px(p["x"]), py(p["y"]),
                   max(p.get("r") or 0, p.get("r_task") or 0, p.get("r_task_pen") or 0))
-                 for p in pts]
+                 for p in active]
     lay = legend_layout([n for _c, n in rows], obstacles)
     items, extra = legend_items(rows, lay)
     pitch, cols = lay["pitch"], lay["cols"]
@@ -1662,7 +1780,7 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
         return PL + 2 + col * pitch, PT + 6 + row * LEGEND_ROW_H
 
     by_c: dict[str, list[dict]] = {}
-    for p in pts:
+    for p in active:
         by_c.setdefault(p["c"], []).append(p)
     panels: list[str] = []
     for i, (c, n) in enumerate(items):
@@ -1671,8 +1789,9 @@ def build_svg(pts: list[dict], front: list[dict], order: list[str],
         # pri=0：综述卡先占位，族卡压在它上面就不贴（每档详述在族卡里，卡不贴也看得见
         # 的是综述那几行 —— 所以顺序按"最强族先"，弱族被挤掉时损失最小）。
         panel = panel_svg(body, "lg", {"c": n, "pri": 0},
-                          [(b["x"], b["y"], b["w"], b["h"]) for b in fam_by_vendor.get(n, [])],
-                          dots=[(px(p["x"]), py(p["y"]), p["r"]) for p in pts])
+                           [(b["x"], b["y"], b["w"], b["h"]) for b in fam_by_vendor.get(n, [])
+                            if "history-for" not in b["keys"]],
+                           dots=[(px(p["x"]), py(p["y"]), p["r"]) for p in active])
         # 一格包成 <g class="lgc" data-c>：共享 JS 按 data-c 把整厂的点与这张聚合卡一起抬起来。
         # 卡本体是平级兄弟（见下面 panels），不塞在格子里 —— 塞进去会被格子的缩放带偏，
         # 而且"谁该显"由 pri 现场判定，兄弟关系才好在同一个顶层里排序。
@@ -2027,17 +2146,22 @@ def main() -> None:
             continue
         unplotted.setdefault(m.get("creator", ""), []).append(m)
 
-    svg = build_svg(pts, front, order, unplotted, penalty=D.get("task_size_penalty"))
+    releases = {}
+    for p in pts:
+        releases.setdefault(p["k"], []).append(p)
+    history = history_successors(releases)
+    svg = build_svg(pts, front, order, unplotted, penalty=D.get("task_size_penalty"), history=history)
     # 爬虫降级（AA 抓不到、回落旧快照）时会在 payload 里标 data_state，
     # 图角上要如实标出来，不能让 1 小时前的数据长得跟实时一样。
     stale = D.get("data_state") not in (None, "ok")
     # 「无数据」只算连同族参照都没有的；推估过的点单独报数，两者不能混成一个口径。
     # 脚注三个计数各自带**精确子集**：索引就是 build_svg 里那轮 enumerate(pts) 的 data-i，
     # 悬停/聚焦只抬这些点，不按 data-k 整族抬（族里可能只有一档属于这个子集）。
+    visible = [(i, p) for i, p in enumerate(pts) if p["k"] not in history]
     groups = {
-        "node": [(i, p["n"]) for i, p in enumerate(pts) if p["tok"] == "无数据"],
-        "est": [(i, p["n"]) for i, p in enumerate(pts) if p["est"]],
-        "band": [(i, p["n"]) for i, p in enumerate(pts) if p["band"]],
+        "node": [(i, p["n"]) for i, p in visible if p["tok"] == "无数据"],
+        "est": [(i, p["n"]) for i, p in visible if p["est"]],
+        "band": [(i, p["n"]) for i, p in visible if p["band"]],
     }
     n_noref, n_est, n_band = (len(groups["node"]), len(groups["est"]), len(groups["band"]))
     payload = build_html(svg, D.get("generated_at", "—"), stale, n_noref, n_est, n_band,

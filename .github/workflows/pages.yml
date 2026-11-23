@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -38,9 +38,22 @@ jobs:
           .venv/bin/python -m pip install --quiet --upgrade pip
           .venv/bin/python -m pip install --quiet -r requirements.txt
 
+      - name: Test history and chart rendering
+        run: .venv/bin/python -B -m unittest discover -s tests
+
       - name: Refresh public data
         run: |
+          previous="$RUNNER_TEMP/modelradar-previous.json"
+          status=$(curl --silent --show-error --max-time 25 --retry 2 --output "$previous" --write-out '%{http_code}' \
+            "https://chr1sch4n-ops.github.io/modelradar/data/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          args=()
+          case "$status" in
+            200) args=(--carry-from "$previous") ;;
+            404) ;; # First deployment has no predecessor.
+            *) echo "Cannot read the previous Pages snapshot: HTTP $status"; exit 1 ;;
+          esac
           .venv/bin/python fetch_model_data.py \
+            "${args[@]}" \
             --sources aa,aa_progress,aa_times,openrouter,models_dev,datalearner,openrouter_usage
           .venv/bin/python -c 'import json, os; d=json.load(open(os.path.join(os.environ["MODELRADAR_DATA_DIR"], "latest.json"))); assert d.get("data_state") == "ok" and d.get("models"), "Fresh complete data is required"'
           .venv/bin/python render_scatter_svg.py -o data/chart.html

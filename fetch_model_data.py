@@ -3173,6 +3173,52 @@ def carry_forward(models: list, con, or_models: dict, dl_rows: list, cfg: dict,
     return len(back)
 
 
+def carry_from_payload(models: list[dict], previous: dict | None,
+                       now: str | None = None) -> int:
+    """带回来**公开站上一版**有、本轮榜单已撤掉的行，给悬停历史对照用。
+
+    公开站每轮都换一台 runner，本地 SQLite 留不住（cache 与 6 分钟一轮的体量都不合适）。
+    上一版 `latest.json` 本身就是可复算的状态：它带每一行的实测值，沿用行还带
+    `carried_asof`。这里把上一版有、本轮没有的行原样接回来，链条就靠发布产物自己续上。
+
+    只在上一版是本轮可比的公开数据时接：评测版本必须一致（跨版不可比），
+    沿用日期超过 CARRY_MAX_DAYS 就丢（与 carry_forward 同一条窗口），
+    with fallback 重复档不回（同一 release 重复视图，接回来只是重合点）。
+    """
+    if not models or not isinstance(previous, dict) or previous.get("data_state") != "ok":
+        return 0
+    rows = previous.get("models") or []
+    version = version_of(models)
+    if not isinstance(rows, list) or not version:
+        return 0
+    try:
+        end = datetime.strptime(now or now_str(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    generated = str(previous.get("generated_at") or "")
+    names = {m.get("name") for m in models}
+    added = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("name")
+        if not isinstance(name, str) or not name or name in names or is_fallback_dup(name):
+            continue
+        if r.get("evaluation_version") != version:
+            continue
+        asof = str(r.get("carried_asof") or generated)
+        try:
+            observed = datetime.strptime(asof, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if not end - timedelta(days=CARRY_MAX_DAYS) <= observed <= end:
+            continue
+        models.append(dict(r, carried_asof=asof))
+        names.add(name)
+        added += 1
+    return added
+
+
 def family_rollup(changes: list[dict]) -> dict:
     """按 (族, 字段) 汇总**所有算得出幅度的档**，包含没到门槛的那些。
 
@@ -3936,7 +3982,7 @@ def notify_fresh(payload: dict) -> None:
 # --------------------------------------------------------------------------- 主流程
 
 @network_budget(ROUND_NETWORK_BUDGET)
-def run(sources: list[str], with_logos: bool) -> dict:
+def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) -> dict:
     cfg = load_config()
     # 来源：2026-10-30 用户截图，失败轮不能用残缺重算覆盖上一张可用图。
     try:
@@ -4188,6 +4234,9 @@ def run(sources: list[str], with_logos: bool) -> dict:
 
     # 被撤下但没被"全面优于"的行沿用回来（判据见 carry_forward）：换版不等于旧模型没价值。
     n_carry = carry_forward(models, con, or_models, dl_rows, cfg, now_str())
+    n_prev = carry_from_payload(models, carry_from, now_str()) if not status.get(SRC_AA, {}).get("stale") else 0
+    if n_prev:
+        log(f"沿用公开站上一版 {n_prev} 行：上一版有、本轮榜上已撤，评测版本一致才带回来")
     if n_carry:
         log(f"沿用 {n_carry} 行：被榜单撤下但评测版本没变，按最后一次实测值带回来，"
              f"显式标「沿用 日期」，最长 {CARRY_MAX_DAYS} 天（with fallback 重复档不带回）")
@@ -4538,9 +4587,23 @@ def main() -> None:
                         "（历史关注厂商当前最高名次更靠后时会按它扩边，只增不减）")
     ap.add_argument("--quarantine-list", action="store_true",
                     help="只读：列出在册的不可信观测与故障日志条数，然后退出（不抓取、不写盘）")
+    ap.add_argument("--carry-from", metavar="LATEST.json",
+                    help="上一版已发布的 latest.json：把上一版有、本轮已撤的行接回来当悬停历史"
+                         "（公开站每轮换 runner，没有本地台账时靠它续链）")
     args = ap.parse_args()
 
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+    carry_from = None
+    if args.carry_from:
+        if args.scheduled or args.loop:
+            ap.error("--carry-from 只用于单轮抓取")
+        try:
+            carry_from = json.loads(Path(args.carry_from).read_text(encoding="utf-8"))
+            if (not isinstance(carry_from, dict) or carry_from.get("data_state") != "ok"
+                    or not isinstance(carry_from.get("models"), list) or not carry_from["models"]):
+                ap.error("上一版载荷缺少完整数据")
+        except (OSError, ValueError) as exc:
+            ap.error(f"读不到上一版载荷：{exc}")
     if args.quarantine_list:
         rules = load_quarantine()
         if not rules:
@@ -4583,7 +4646,7 @@ def main() -> None:
         return
     while True:
         try:
-            payload = run(sources, not args.no_logos)
+            payload = run(sources, not args.no_logos, carry_from)
             if not args.loop and payload.get("data_state") in ("empty", "stale"):
                 sys.exit(2)
         except Exception:  # noqa: BLE001
