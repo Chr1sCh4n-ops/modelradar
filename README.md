@@ -1382,3 +1382,16 @@ shell 字符串（模型名来自远端页面，拼 shell 就是命令注入的�
 | 重复弹通知 | 组件与爬虫共用 `.last_notified`（内容指纹），检查两处是否都在写同一个文件 |
 | `config/watchlist.json` 显示"改了没提交" | 10-20 之前是正常的（爬虫每轮写它）；现在**所有**写盘（含 `--refresh-watchlist`）都只落 `~/Library/Application Support/ModelRadar/config/watchlist.json`，仓库那份只该在**你手工编辑它**时变。若它又脏了：有代码绕开了 `save_config` 这个唯一写口（`test_读写各只有一处` 会红） |
 | 速度/延迟整族同向大跌，而**另一台机同轮正常** | 先怀疑本机跑的不是同一版：`git -C "$MR_REPO" log --oneline -1`、`git status`（游离 HEAD 就是没跟上），`⋯ → 数据状态…` 也写着跑的哪一版。再比两轮口径：`sqlite3 "$MODELRADAR_DATA_DIR/ModelRadar.db"` 取 `source='aa'` 各轮 payload，看 `total_s` 是否整列变 null、`tok_s` 是否等于同轮 `time_per_task_s/60`（等于就是把「每任务分钟」读成了 TPS）。修法见 `2026-11-06` 修正记录：ff 到 `origin/main` + 按轮次与字段派生隔离 + **再跑一轮**才刷新已落库的比较块 |
+
+## 远端与身份（2026-11-25 定）
+
+| 目录 / 远端 | 地址 | 身份 | 权限 |
+| --- | --- | --- | --- |
+| 本机源码 `origin` | `ssh://git@mini-git/chr1sch4n/agents-modelradar.git` | `~/.ssh/chr1sch4n` → mini Gitea `chr1s-mbp` | 读写 |
+| 本机源码 `public` | `git@github.com:Chr1sCh4n-ops/modelradar.git` | 同一把 SSH key → GitHub `Ch4nch1` | **只读**（push URL 已禁用） |
+| 公共仓库写入口 | `https://api.github.com/repos/Chr1sCh4n-ops/modelradar` | macOS keychain `x-access-token`（`Chr1sCh4n-ops` GitHub App） | 读写 |
+| 公共导出目录 | `/tmp/modelradar-public` | 同上 token | 读；写走 API |
+
+- `github.com:443` 的 git 传输在本机经常超时；`api.github.com` 正常。公共变更用 Git Data API（blob → tree → commit → ref）推送，不用 `git push public`。
+- `git push public` 已禁用；`Ch4nch1` 对 `Chr1sCh4n-ops/modelradar` 没有写权限。
+- `.github/workflows/pages.yml` 负责公共站点的构建/发布；它不依赖本机身份，使用仓库自己的 GitHub App 权限。
