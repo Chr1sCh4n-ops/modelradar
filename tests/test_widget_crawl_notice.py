@@ -13,6 +13,7 @@ data_state 为 empty/stale 的既定约定）。crawl.sh 的渲染是无条件�
 """
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,7 +81,7 @@ class CrawlNoticeSourceContract(unittest.TestCase):
         self.assertIn('hasPrefix("http")', self.src)
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "需要 swiftc")
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("swiftc"), "需要 macOS + swiftc")
 class CrawlNoticeBehavior(unittest.TestCase):
     """跑生产裁决与真实遮罩；算法只有一份，就在 ChartWidget.swift 里。"""
 
