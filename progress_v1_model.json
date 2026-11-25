@@ -1,0 +1,21 @@
+{
+  "version": "v1",
+  "trained_on": "2026-11-24 20:37:54",
+  "target_snapshot": "2026-11-24 20:38:09",
+  "features": [
+    "intelligenceIndex"
+  ],
+  "model": "quadratic",
+  "coefficients": [
+    199.753968115,
+    5.8793652103,
+    -0.0579814307
+  ],
+  "n": 125,
+  "metrics": {
+    "mae": 10.447,
+    "r2": 0.8842
+  },
+  "anchors": 28,
+  "note": "Progress v1 IRT is not reproduced; this is a monotone calibration."
+}

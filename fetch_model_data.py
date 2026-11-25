@@ -8,8 +8,10 @@ ModelRadar 抓取器
 数据源
   1. AA 官方榜      https://artificialanalysis.ai/leaderboards/models   （服务端渲染真表格，可直接解析）
      字段：指数 / 每任务成本 USD / 中位 tok/s / TTFT / 总响应 / 上下文 / 厂商 / logo
-  2. AA 每任务耗时  https://artificialanalysis.ai/models                 （公开加密 manifest，
-     models[].intelligenceIndexTimePerTask，原始秒；仅此页有该字段）
+  2. AA 每任务耗时  V2 API https://artificialanalysis.ai/api/v2/language/models
+                    （Pro/Commercial key 的 performance_v3.time_per_task_seconds）
+                    无 key 时读榜单页 initialModels 的 intelligenceIndexTimePerTask。
+                    旧的 /models 加密 manifest 与 /api/v2/data/* 已下线。
   3. OpenRouter     https://openrouter.ai/api/v1/models                 （实时美元输入/输出单价）
   4. DataLearner    国内 AA 镜像 https://www.datalearner.com/leaderboards/external/aa-quality-index
                                                                         （国内站，更新滞后但可作交叉验证）
@@ -17,6 +19,8 @@ ModelRadar 抓取器
      https://openrouter.ai/api/frontend/v1/rankings/models?view=week
      字段：每模型周请求数 / prompt+completion token 量。非官方前端接口；
      抓不到时图例退回旧的指数加权，并在 data_state 标 degraded。
+  6. models.dev           https://models.dev/api.json
+     社区模型目录交叉源：只补 OpenRouter 缺失的上下文与名义价格，不覆盖实时报价。
 
 设计约束
   * 单源失败不影响整体：某源挂了就标记 status=error，沿用上一次的好数据并标注 stale。
@@ -39,6 +43,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import ssl
 import sqlite3
@@ -282,8 +287,8 @@ KEEP_SNAPSHOT_DAYS = 90
 SOURCES = {
     SRC_AA: "https://artificialanalysis.ai/leaderboards/models",
     SRC_PROGRESS: "https://artificialanalysis.ai/trends",
-    # /models 页面下发的加密 manifest 里带 models[].intelligenceIndexTimePerTask（原始秒）。
-    # 榜单页 / leaderboards 与趋势页 / trends 的 manifest 都没有这个字段。
+    # 旧 /models 页面下发的加密 manifest（2026-11-25 起全部 404，仅作最后兜底）。
+    # 新出口是 V2 API 的 performance_v3.time_per_task_seconds，或榜单页内嵌读数。
     SRC_AA_TIMES: "https://artificialanalysis.ai/models",
     SRC_OR: "https://openrouter.ai/api/v1/models",
     SRC_DL: "https://www.datalearner.com/leaderboards/external/aa-quality-index",
@@ -292,6 +297,23 @@ SOURCES = {
 }
 
 AA_METHODOLOGY = "https://artificialanalysis.ai/methodology/intelligence-benchmarking"
+
+# 2026-11-25：AA 把数据出口换到 V2 API。旧 /api/v2/data/* 返回 410 Gone，
+# 站点内部 /data/<hash>.txt 加密包也全部 404；新接口见
+# https://artificialanalysis.ai/data-api/migrate-v2-data 。
+# 时间数据只在 Pro/Commercial tier 的 performance_v3.time_per_task_seconds 里；
+# Free tier 明确不含 time per task，所以没有 key 时退回榜单页 initialModels 的内嵌读数。
+AA_API_BASE = "https://artificialanalysis.ai/api/v2"
+AA_API_MODELS = AA_API_BASE + "/language/models"
+AA_API_MAX_PAGES = 10
+AA_API_KEY_ENV = "AA_API_KEY"
+AA_API_KEY_HINT = ("在 ~/Library/Application Support/ModelRadar/runtime.env 里写 "
+                   "AA_API_KEY=\"<Pro/Commercial key>\"；Free key 不含 time per task")
+
+# Progress v1 的官网加密包 2026-11-25 已 404。基线冻结最后一版官方 5.0.1 分数；
+# 新增型号用 AA Index 的二次校准估计，锚点来自 /trends 当页 28 行。
+PROGRESS_BASELINE_PATH = HERE / "progress_v1_baseline.json"
+PROGRESS_MODEL_PATH = HERE / "progress_v1_model.json"
 
 
 def evaluation_version(page: str) -> str:
@@ -351,7 +373,7 @@ def parse_progress(page: str) -> tuple[list[dict], str]:
     candidates = []
     decode_errors = []
     for path, key_hex in re.findall(r'"manifest":\{"path":"([^"]+)","key":"([^"]+)"', text):
-        if not re.fullmatch(r'/data/[a-zA-Z0-9]+\.txt', path):
+        if not re.fullmatch(r'/data/[A-Za-z0-9._/-]+', path):
             continue
         try:
             obj = _decode_manifest(path, key_hex)
@@ -454,7 +476,8 @@ def _match_variant(slug: str | None, tier: str, index) -> dict | None:
     return candidates[0] if candidates and len(candidates) == 1 else None
 
 
-def attach_progress(models: list[dict], rows: list[dict], version: str | None) -> int:
+def attach_progress(models: list[dict], rows: list[dict], version: str | None,
+                    only_missing: bool = False) -> int:
     """只匹配完整型号与档位，不把最佳档广播到同族。
 
     2026-11-15：榜单改成每个 release 一行后，`aa_slug` 只在同档位下唯一 ——
@@ -471,7 +494,13 @@ def attach_progress(models: list[dict], rows: list[dict], version: str | None) -
     index = _variant_index(rows, version)
     matched = 0
     for m in models:
-        m["progress_index"], m["progress_version"] = None, version
+        if not only_missing:
+            m["progress_index"], m["progress_version"] = None, version
+            m["progress_estimated"] = False
+            m["progress_source"] = None
+            m["progress_anchor"] = False
+        if m.get("progress_index") is not None:
+            continue
         if m.get("carried_asof"):
             continue
         if m.get("aa_slug"):
@@ -489,8 +518,99 @@ def attach_progress(models: list[dict], rows: list[dict], version: str | None) -
         score = row.get("score")
         if isinstance(score, (int, float)) and not isinstance(score, bool) and -1e6 < score < 1e6:
             m["progress_index"] = score
+            m["progress_version"] = version
+            m["progress_estimated"] = bool(row.get("estimated"))
+            m["progress_source"] = "calibrated" if row.get("estimated") else (
+                "baseline" if row.get("baseline") else "official")
+            m["progress_anchor"] = bool(row.get("anchor"))
             matched += 1
     return matched
+
+
+def load_progress_artifacts() -> tuple[list[dict], dict | None]:
+    """Load the frozen v1 baseline and the monotone calibration model.
+
+    The baseline keeps the last official 5.0.1 Progress scores. The model is only
+    used for variants that are newer than that snapshot. Both files are committed
+    so a scheduled run never needs the retired /data package.
+    """
+    try:
+        baseline = json.loads(PROGRESS_BASELINE_PATH.read_text(encoding="utf-8"))
+        model = json.loads(PROGRESS_MODEL_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log(f"Progress 基线不可用：{exc}")
+        return [], None
+    if not isinstance(baseline, dict) or not isinstance(model, dict):
+        return [], None
+    rows = []
+    for item in baseline.get("scores") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "name": item.get("name"),
+            "release_slug": item.get("release"),
+            "suffix": item.get("tier"),
+            "score": item.get("score"),
+            "evaluation_version": baseline.get("version"),
+            "anchor": bool(item.get("anchor")),
+            "baseline": True,
+            "estimated": False,
+        })
+    return rows, model
+
+
+def calibrate_progress(models: list[dict], model: dict | None) -> int:
+    """Fill missing Progress scores from AA Index with the committed quadratic.
+
+    Progress v1 is an IRT score over task-level data, which the public aggregate
+    API does not expose. This calibration preserves order and the anchor scale;
+    callers expose progress_estimated=True and keep the raw index for audit.
+    """
+    if not model or model.get("model") != "quadratic":
+        return 0
+    coefficients = model.get("coefficients") or []
+    if len(coefficients) != 3 or any(not isinstance(c, (int, float)) for c in coefficients):
+        return 0
+    filled = 0
+    for m in models:
+        if m.get("progress_index") is not None or m.get("carried_asof"):
+            continue
+        index = m.get("index")
+        if not isinstance(index, (int, float)) or isinstance(index, bool):
+            index = m.get("intelligenceIndex")
+        if not isinstance(index, (int, float)) or isinstance(index, bool):
+            continue
+        score = (coefficients[0] + coefficients[1] * index
+                 + coefficients[2] * index * index)
+        score = max(0.0, min(400.0, score))
+        m["progress_index"] = round(score, 2)
+        m["progress_version"] = model.get("version") or "v1"
+        m["progress_estimated"] = True
+        m["progress_source"] = "calibrated"
+        m["progress_anchor"] = False
+        m["progress_model"] = f"progress-{model.get('version', 'v1')}"
+        filled += 1
+    return filled
+
+
+def mark_progress_anchors(models: list[dict], baseline_rows: list[dict]) -> int:
+    """Mark the live /trends anchor variants even when the full package is official.
+
+    The baseline carries the 28 anchor flags; matching them onto current models is
+    only presentation metadata. It never changes a score.
+    """
+    keys = set()
+    for row in baseline_rows:
+        if not row.get("anchor"):
+            continue
+        keys.add((row.get("release_slug"), _tier_key(str(row.get("suffix") or ""))))
+    count = 0
+    for m in models:
+        key = (m.get("aa_slug"), _tier_key(split_series(m.get("name") or "")[1]))
+        if key in keys:
+            m["progress_anchor"] = True
+            count += 1
+    return count
 
 
 TASK_TIME_FIELD = "intelligenceIndexTimePerTask"
@@ -522,13 +642,13 @@ def task_output_tokens(value) -> float | None:
 
 
 def parse_task_times(page: str, raw_fetch=None) -> list[dict]:
-    """从 /models 的公开加密 manifest 读取每任务耗时（原始秒），并保留全部型号行。"""
+    """旧 /models 公开加密 manifest 的解析器（2026-11-25 起上游 404，仅作最后兜底）。"""
     text = _rsc_text(page)
     raw_fetch = raw_fetch or fetch_task_manifest
     candidates = []
     fetch_errors = []
     for path, key_hex in re.findall(r'"manifest":\{"path":"([^"]+)","key":"([^"]+)"', text):
-        if not re.fullmatch(r'/data/[a-zA-Z0-9]+\.txt', path):
+        if not re.fullmatch(r'/data/[A-Za-z0-9._/-]+', path):
             continue
         try:
             obj = _decode_manifest(path, key_hex, raw_fetch)
@@ -586,13 +706,31 @@ def attach_task_times(models: list[dict], rows: list[dict], version: str | None)
         m["output_tokens_per_task"] = None
     if not version:
         return 0
+
+    def norm_name(value) -> str:
+        # API 的 name 会带 "Default Fallback"，页面 shortName 不带；先去这段再比。
+        s = re.sub(r'\bdefault\s*fallback\b', '', str(value or ''), flags=re.I)
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
     index = _variant_index(rows, version)
+    by_name: dict[str, list[dict]] = {}
+    for r in rows:
+        if version is not None and r.get("evaluation_version") not in (None, version):
+            continue
+        key = norm_name(r.get("name"))
+        if key:
+            by_name.setdefault(key, []).append(r)
     matched = 0
     for m in models:
         if m.get("carried_asof") or m.get("evaluation_version") != version:
             continue
         row = _match_variant(m.get("aa_slug"),
                              _tier_key(split_series(m.get("name") or "")[1]), index)
+        if row is None:
+            # V2 API 的 slug 是 release，但档位只写在 name 里；slug/档位对不上时
+            # 用去重后的整名再试一次，仍然唯一才采用。
+            candidates = by_name.get(norm_name(m.get("name")), [])
+            row = candidates[0] if len(candidates) == 1 else None
         if row is None:
             continue
         value = task_time_seconds(row.get("time_per_task_s"))
@@ -603,6 +741,48 @@ def attach_task_times(models: list[dict], rows: list[dict], version: str | None)
             m["time_per_task_s"] = value
             matched += 1
     return matched
+
+
+def has_inline_time_schema(rows: list[dict]) -> bool:
+    """新版榜单行才带 inline_* 键；旧版表格没有，别让旧版测试误触发无头。"""
+    return any("inline_time_per_task_s" in r for r in rows)
+
+
+def inline_time_coverage(rows: list[dict]) -> float:
+    """当前榜单页里带内嵌任务耗时的行占比；低到阈值以下才启用无头兜底。"""
+    if not rows:
+        return 0.0
+    return sum(1 for r in rows if r.get("inline_time_per_task_s") is not None) / len(rows)
+
+
+def inline_task_rows(aa_rows: list[dict], version: str | None) -> list[dict]:
+    """从榜单页 initialModels 的当前版本读数构造与旧 manifest 同形的耗时行。
+
+    2026-11-25：AA 的 /data/<hash>.txt 加密包 404，但榜单页自己仍下发
+    intelligenceIndexTimePerTask（原始秒，当前版本）。没有 API key 时这是唯一
+    能拿到同版时间、又不依赖旧快照的来源；只收有值的档，缺失留空不估算。
+    """
+    out = []
+    for row in aa_rows:
+        value = task_time_seconds(row.get("inline_time_per_task_s"))
+        slug = row.get("aa_slug")
+        if value is None or not slug:
+            continue
+        # 旧包/新页的每任务输出量本来就等于 时间×该源速度；内嵌没单独下发时
+        # 用同一关系补回，和旧值对得上（实测 106 档中位比 1.000）。
+        tokens = task_output_tokens(row.get("inline_output_tokens_per_task"))
+        if tokens is None and row.get("tok_s"):
+            tokens = task_output_tokens(value * row["tok_s"])
+        out.append({
+            "slug": slug,
+            "name": row.get("name"),
+            "release_slug": slug,
+            "suffix": row.get("inline_suffix"),
+            "time_per_task_s": value,
+            "output_tokens_per_task": tokens,
+            "evaluation_version": version,
+        })
+    return out
 
 
 # 同轮窗口：一轮里 AA → Progress → 耗时三份快照各差几秒（整轮网络预算 240s）。
@@ -855,6 +1035,7 @@ PROXY_PROBE_TIMEOUT = 1.5
 # 仍低于单源预算 100s，一轮六个源最多多花几秒。
 PROXY_TUNNEL_TIMEOUT = 6.0
 # 零时间戳不能当空标记：新 Python 进程的 monotonic 时钟可能从接近零开始。
+# 用显式空缓存区分“尚未探测”。
 _proxy_cache: tuple[float, str | None] | None = None
 _proxy_logged: str | None = None
 # (proxy, host) -> (单调时钟时刻, 隧道是否可用)。按 host 记，不按代理整体记：
@@ -1058,7 +1239,8 @@ def _resume_total(header_path: Path) -> int | None:
 
 
 def fetch(url: str, timeout: int = 40, retries: int = 2,
-          budget: float = FETCH_BUDGET, total_budget: float = FETCH_TOTAL_BUDGET) -> bytes:
+          budget: float = FETCH_BUDGET, total_budget: float = FETCH_TOTAL_BUDGET,
+          http_headers: dict[str, str] | None = None) -> bytes:
     """抓一个 URL，全程受来源/整轮截止约束。两段式，只为修 2026-11-04 实测的慢滴上游。
 
     第一段与改动前完全一致（`--compressed` 一次性直传）：健康源（OpenRouter、
@@ -1082,6 +1264,8 @@ def fetch(url: str, timeout: int = 40, retries: int = 2,
     deadline = min(time.monotonic() + total_budget, _network_deadline.get())
     last: Exception | None = None
     part: Path | None = None
+    # 请求头只给调用方显式要求的那条 URL。API key 不落日志、不进状态文件。
+    hdr_args = [arg for k, v in (http_headers or {}).items() for arg in ("-H", f"{k}: {v}")]
     try:
         first_left = deadline - time.monotonic()
         if first_left <= 0:
@@ -1090,7 +1274,7 @@ def fetch(url: str, timeout: int = 40, retries: int = 2,
         try:
             result = subprocess.run(
                 ["/usr/bin/curl", "--disable", "-f", "-sS", "-L", "--compressed",
-                 "-A", UA, *proxy_curl_args(url),
+                 "-A", UA, *hdr_args, *proxy_curl_args(url),
                  "--connect-timeout", str(min(timeout, FETCH_CONNECT_CAP, limit)),
                  "--max-time", str(limit), url],
                 capture_output=True, timeout=limit)
@@ -1113,7 +1297,7 @@ def fetch(url: str, timeout: int = 40, retries: int = 2,
                 slice_limit = min(FETCH_RESUME_SLICE, deadline - time.monotonic())
                 have = part.stat().st_size if part.exists() else 0
                 args = ["/usr/bin/curl", "--disable", "-f", "-sS", "-L", "-A", UA,
-                        *proxy_curl_args(url),
+                        *hdr_args, *proxy_curl_args(url),
                         "--connect-timeout", str(min(timeout, FETCH_CONNECT_CAP, slice_limit)),
                         "-H", "Accept-Encoding: identity", "-D", str(headers),
                         "--max-time", str(slice_limit), "-o", str(part)]
@@ -1162,6 +1346,12 @@ TASK_FETCH_CONNECT_TIMEOUT = 10
 # 改成与单源预算对齐：总时长仍由共享 deadline 约束，不会超额。
 TASK_FETCH_MAX_TIME = SOURCE_NETWORK_BUDGET
 
+# 内嵌为主，无头浏览器只做兜底：只有直连页面缺内嵌读数时才启动，且有硬超时。
+# 匿名临时 profile，不使用登录态，不绕过付费墙；Pro 明细仍走 V2 API key。
+HEADLESS_TIMEOUT = 30
+HEADLESS_VIRTUAL_TIME_BUDGET_MS = 8000
+AA_INLINE_MIN_RATIO = 0.5
+
 
 def fetch_task_manifest(url: str) -> bytes:
     """抓任务页面或manifest，共用来源及整轮截止，不另开回退预算。
@@ -1172,6 +1362,177 @@ def fetch_task_manifest(url: str) -> bytes:
     """
     return fetch(url, timeout=TASK_FETCH_CONNECT_TIMEOUT, retries=2,
                  budget=TASK_FETCH_MAX_TIME, total_budget=TASK_FETCH_MAX_TIME)
+
+
+_HEADLESS_DISABLED_REASON: str | None = None
+
+
+def headless_disabled() -> bool:
+    """无头兜底的显式开关：runtime.env/环境变量可关；进程内遇到钥匙串错误也关。"""
+    if _HEADLESS_DISABLED_REASON:
+        return True
+    if os.environ.get("MODELRADAR_NO_HEADLESS"):
+        return True
+    return bool(mr_paths.runtime_env().get("MODELRADAR_NO_HEADLESS"))
+
+
+def chrome_binary() -> str | None:
+    """找可用的无头浏览器二进制；macOS/Linux/Windows 与 GitHub Actions 都能用。
+
+    优先 PATH（ubuntu-latest 自带 google-chrome），再找 Playwright 缓存
+    （PLAYWRIGHT_BROWSERS_PATH 或 ~/.cache/ms-playwright），最后才是平台默认路径。
+    """
+    if headless_disabled():
+        return None
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "chrome", "chrome.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = []
+    if sys.platform == "darwin":
+        candidates += ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                       "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    elif sys.platform.startswith("linux"):
+        candidates += ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+                       "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"]
+    elif os.name == "nt":
+        for base in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)")):
+            if base:
+                candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
+        if os.environ.get("LOCALAPPDATA"):
+            candidates.append(os.path.join(os.environ["LOCALAPPDATA"],
+                                           "Google", "Chrome", "Application", "chrome.exe"))
+    roots = []
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        roots.append(Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]))
+    roots += [Path.home() / ".cache" / "ms-playwright",
+              Path.home() / "Library" / "Caches" / "ms-playwright"]
+    if os.environ.get("LOCALAPPDATA"):
+        roots.append(Path(os.environ["LOCALAPPDATA"]) / "ms-playwright")
+    patterns = ("chromium-*/chrome-linux/chrome",
+                "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+                "chromium-*/chrome-win/chrome.exe")
+    for root in roots:
+        for pattern in patterns:
+            for path in root.glob(pattern):
+                if os.path.isfile(path) and os.access(path, os.X_OK):
+                    return str(path)
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def fetch_rendered_page(url: str, timeout: int = HEADLESS_TIMEOUT) -> bytes:
+    """用无头浏览器渲染公开页面并返回 DOM。只在内嵌读数缺失时兜底。
+
+    2026-11-25 实测：AA 榜单页是服务端渲染，curl 已能拿到全部 initialModels；
+    这里只在页面退化成纯客户端渲染时补位。临时 profile + 硬超时，不用登录态，
+    不绕付费墙；Chrome 的 stderr 里有 CVDisplayLink 噪音但 rc=0，不影响 DOM。
+    """
+    binary = chrome_binary()
+    if not binary:
+        raise RuntimeError("无头浏览器不可用（未找到 Chrome/Chromium）")
+    # 不用 proxy_curl_args 的隧道预检：那个检查偶尔会把可用代理判死，Chrome
+    # 自己会重试；有系统代理就显式交给它，没有才直连。
+    proxy_addr = system_proxy()
+    with tempfile.TemporaryDirectory(prefix="modelradar-chrome-") as profile:
+        # macOS 上 Chrome 会去读 Chrome Safe Storage 钥匙串；后台上/launchd 里
+        # 钥匙串不可用时就会弹“找不到钥匙串”。用 mock keychain + basic store
+        # 把它和用户钥匙串隔开，无头只读公开页，不需要任何密码。
+        args = [binary, "--headless=new", "--disable-gpu", "--no-first-run",
+                "--no-default-browser-check", "--use-mock-keychain",
+                "--password-store=basic", f"--user-data-dir={profile}",
+                f"--virtual-time-budget={HEADLESS_VIRTUAL_TIME_BUDGET_MS}", "--dump-dom"]
+        if sys.platform.startswith("linux"):
+            # GitHub Actions / 容器里没有 user namespace，/dev/shm 也只有 64MB。
+            args += ["--no-sandbox", "--disable-dev-shm-usage"]
+        if proxy_addr:
+            args.append(f"--proxy-server={proxy_addr}")
+        args.append(url)
+        try:
+            result = subprocess.run(args, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"无头浏览器渲染 {url} 超时（{timeout}s）")
+        if result.returncode != 0 or not result.stdout:
+            detail = result.stderr.decode("utf-8", "replace").strip()[-300:]
+            low = detail.lower()
+            if any(x in low for x in ("keychain", "钥匙串", "safe storage",
+                                      "keyring", "secret service")):
+                global _HEADLESS_DISABLED_REASON
+                _HEADLESS_DISABLED_REASON = "Chrome 钥匙串不可用"
+            raise RuntimeError(f"无头浏览器 rc={result.returncode}: {detail}")
+        return result.stdout
+
+
+def aa_api_key() -> str | None:
+    """AA V2 API key。只从环境或本机 runtime.env 取，不写进仓库、日志或 latest.json。
+
+    Free key 也能调通，但 Free tier 明确不含 time per task；要拿时间必须 Pro/Commercial。
+    """
+    key = (os.environ.get(AA_API_KEY_ENV) or "").strip()
+    if key:
+        return key
+    return (mr_paths.runtime_env().get(AA_API_KEY_ENV) or "").strip() or None
+
+
+def fetch_aa_api_models(version: str | None = None) -> tuple[list[dict], str, object]:
+    """按 V2 API 拉全部语言模型，返回与旧 manifest 同形的耗时行。
+
+    2026-11-25 上游迁移：旧 /api/v2/data/llms/models 已 410 Gone，新接口是
+    /api/v2/language/models。Pro/Commercial tier 的
+    performance_v3.time_per_task_seconds 才是每任务耗时；Free tier 不含该字段。
+    分页用 pagination.has_more，不靠固定页数猜总量。
+    """
+    key = aa_api_key()
+    if not key:
+        raise RuntimeError(f"AA_API_KEY 未设置（{AA_API_KEY_HINT}）")
+    rows: list[dict] = []
+    tier, api_version = None, None
+    page = 1
+    while page <= AA_API_MAX_PAGES:
+        raw = fetch(f"{AA_API_MODELS}?page={page}",
+                    timeout=TASK_FETCH_CONNECT_TIMEOUT, retries=1,
+                    http_headers={"x-api-key": key})
+        doc = json.loads(raw)
+        if not isinstance(doc, dict):
+            raise ValueError("AA API 响应不是对象")
+        tier = doc.get("tier") or tier
+        api_version = doc.get("intelligence_index_version", api_version)
+        data = doc.get("data")
+        if not isinstance(data, list):
+            raise ValueError("AA API data 不是列表")
+        for model in data:
+            if not isinstance(model, dict) or not model.get("slug"):
+                continue
+            _, suffix = split_series(str(model.get("name") or ""))
+            perf = model.get("performance_v3") or {}
+            value = task_time_seconds(perf.get("time_per_task_seconds"))
+            # 新 API 只给总 token 计数，不给每任务 output；但 performance_v3 的
+            # time 就是用 mean speed 算的，时间×mean speed 即同一口径的每任务输出量。
+            speed = perf.get("mean_output_tokens_per_second")
+            tokens = (task_output_tokens(value * speed)
+                      if value is not None and isinstance(speed, (int, float))
+                      and not isinstance(speed, bool) else None)
+            rows.append({
+                "slug": model.get("slug"),
+                "name": model.get("name"),
+                "release_slug": model.get("slug"),
+                "suffix": suffix or None,
+                "time_per_task_s": value,
+                "output_tokens_per_task": tokens,
+                "evaluation_version": version,
+            })
+        pagination = doc.get("pagination") or {}
+        if not pagination.get("has_more"):
+            break
+        page += 1
+    if not rows:
+        raise RuntimeError("AA API 返回 0 个模型")
+    if not any(r["time_per_task_s"] is not None for r in rows):
+        raise RuntimeError(f"AA API tier={tier or 'unknown'} 不含 time per task（需要 Pro/Commercial key）")
+    return rows, str(tier or "unknown"), api_version
 
 
 # --------------------------------------------------------------------------- 工具
@@ -1200,8 +1561,19 @@ def num(text: str | None):
     return int(v) if v == int(v) else v
 
 
+# 一条分段规则服务三处：派生候选、watchlist 匹配、OpenRouter 对齐。
+# 连续字母是一段，连续数字（点留在段内）是一段；连字符、空格、点号、括号只是分隔符。
+# 这样 'Qwen3.8' 与 'qwen-3.8' 切出同一组段，而 'v4' 仍是 ['v','4']，不会命中 'v4.1'。
+MODEL_SEGMENT_RE = re.compile(r"[a-z]+(?:\.[a-z]+)*|\d+(?:\.\d+)*")
+
+
+def segments(name: str) -> list[str]:
+    """把模型名切成字母段/数字段。版本号 '3.8' 是一个数字段，不被点拆开。"""
+    return MODEL_SEGMENT_RE.findall((name or "").lower())
+
+
 def norm_key(name: str) -> str:
-    """'DeepSeek V4.1 Flash (max)' -> 'deepseekv41flashmax'。关键词用这个做子串匹配才不会漏。"""
+    """'DeepSeek V4.1 Flash (max)' -> 'deepseekv41flashmax'。只用于子串比较，不用于分词。"""
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
@@ -1220,15 +1592,9 @@ def _strip_parens(s: str) -> str:
 
 
 def tokens_list(name: str) -> list[str]:
-    """有序 token 列表：'GLM-5.3 (max)' -> ['glm', '5.3']（版本号 '5.3' 必须整体保留）。"""
-    s = _strip_parens(name.lower())
-    s = re.sub(r"[^a-z0-9.]+", " ", s)
-    out = []
-    for raw in s.split():
-        t = raw.strip(".")
-        if t and t not in EFFORT_TOKENS:
-            out.append(t)
-    return out
+    """有序段列表：'GLM-5.3 (max)' -> ['glm', '5.3']（'5.3' 是一个数字段）。"""
+    s = _strip_parens((name or "").lower())
+    return [t for t in MODEL_SEGMENT_RE.findall(s) if t not in EFFORT_TOKENS]
 
 
 def tokens(name: str) -> set[str]:
@@ -1364,6 +1730,16 @@ def _parse_aa_models(html: str, table, columns: dict[str, int], width: int, txt)
             "ttft_s": _nonneg(model.get("timeToFirstToken")),
             "total_s": None,       # 新版不再提供旧基准总响应，不能用首回答延迟冒充。
             "first_answer_s": _nonneg(model.get("timeToFirstAnswerToken")),
+            # 2026-11-25：站内 /data/<hash>.txt 加密包已全部 404，但榜单页自己的
+            # initialModels 仍带当前版本的原始秒。无 API key 时用它兜底，版本门由
+            # 调用方统一写成当轮 evaluation_version。
+            "inline_suffix": (model.get("suffix")
+                              or ((model.get("effort") or {}).get("slug")
+                                  if isinstance(model.get("effort"), dict) else None)),
+            "inline_time_per_task_s": task_time_seconds(
+                model.get("intelligenceIndexTimePerTask")),
+            "inline_output_tokens_per_task": task_output_tokens(
+                model.get("intelligenceIndexOutputTokensPerTask")),
             "output_tokens_per_task": None,
             "logo": logo or (model.get("modelCreatorLogo") or ""),
         })
@@ -1485,7 +1861,10 @@ def parse_openrouter(payload: bytes) -> dict:
 
 
 def parse_models_dev(payload: bytes) -> dict[str, dict]:
-    """按 canonical model identity 展开 models.dev provider 目录。"""
+    """按 canonical model identity 展开 models.dev provider 目录。
+
+    目录是参考源，不是计费源。只保留交叉核对 OpenRouter 所需字段，并拒绝坏条目。
+    """
     try:
         providers = json.loads(payload)
     except (json.JSONDecodeError, TypeError) as exc:
@@ -1786,14 +2165,15 @@ def attach_usage(models: list[dict], or_models: dict, usage: dict[str, dict],
 
 
 def norm_runs(s: str) -> list[str]:
-    """**带边界**的分词：小写，非 [a-z0-9.] 一律当分隔符，每段去掉首尾的点。
+    """**带边界**的分段：与 tokens_list 共用 MODEL_SEGMENT_RE。
 
     为什么不用 norm_key 做匹配：它把标点直接删掉，边界信息随之没了 —— 'sol' 于是
     是 'Solar' 的子串、'ling' 是 'Inkling' 的子串、'mini' 是 'Gemini' 的子串，
     关键词会把隔壁厂商整族捞进表里，而图上看着完全正常。
-    点保留在段内，是为了 'qwen3.8'、'3.1' 这种版本号仍是一个整体（不能退化成 '3'）。
+    字母段与数字段分开后，'qwen' 能命中 'Qwen3.8'/'Qwen4'；'qwen3.8' 仍是
+    ['qwen','3.8']，不会命中 Qwen4；'v4' 是 ['v','4']，不会命中 'V4.1'。
     """
-    return [t.strip(".") for t in re.split(r"[^a-z0-9.]+", (s or "").lower()) if t.strip(".")]
+    return segments(s)
 
 
 def runs_hit(kr: list[str], rs: list[str]) -> bool:
@@ -1823,8 +2203,9 @@ def want_row(row: dict, kw_inc: list[str], kw_exc: list[str]) -> bool:
 
 # 派生关键词的判据全部是「量出来的」，没有手写停用词表 —— 上一版靠一张
 # DERIVE_STOPWORDS 硬列 flash/max/pro/with…，来了新厂商或新档位词就得回去补表。
-MAX_FANOUT = 0.15         # 词命中的行数占全表比例上限（'gpt' 25/126、'claude' 21/126 都出局）
-MAX_CREATOR_SPREAD = 2    # 词跨的厂商数上限（'max' 跨 9 家、'flash' 跨 7 家 → 通用词）
+# 关键词必须是**一家独有**的命名段：跨两家就是通用词（max/flash/pro/preview 都在这条上出局）。
+# 不再按命中行数设上限 —— 那会把 'gpt'/'claude' 这种整个家族踢掉，新代次一换代号就漏。
+MAX_CREATOR_SPREAD = 1
 HEAD_RATIO = 0.5          # 词必须落在「命名主体」：括号前的产品名或厂商名，不是档位后缀
 WATCHLIST_TOP_N = 50      # 派生名次线的**基础值**（CLI 默认值与抓取钩子共用这一个数；
                           # 实际生效线见 watchlist_boundary：历史厂商掉出后按最高名次扩边）
@@ -1924,27 +2305,49 @@ def token_stats(aa_rows: list[dict], tokens: set[str]) -> dict[str, tuple[frozen
     return out
 
 
+def _segment_candidates(name: str) -> tuple[set[str], set[str]]:
+    """拆出可派生的关键词候选：(单段家族词, 两段版本词)。
+
+    单段：字母段 ≥3；两字母的连写家族（'Hy4' 的 'hy'）也收，因为不拆就只剩 'hy4'。
+    两段：字母段 + 紧邻的数字段，且字母段 ≥2（排除 'v4.1'、'k3.1' 这类纯版本标记）。
+    派生主轮只用单段；两段只在前者覆盖不到某一行时兜底，词形种类越少越好。
+    """
+    segs = tokens_list(name)
+    one: set[str] = set()
+    two: set[str] = set()
+    for i, t in enumerate(segs):
+        if not t[0].isalpha():
+            continue
+        glued = i + 1 < len(segs) and segs[i + 1][0].isdigit()
+        if len(t) >= 3 or (len(t) == 2 and glued):
+            one.add(t)
+        if glued and len(t) >= 2:
+            two.add(t + segs[i + 1])
+    return one, two
+
+
 def derive_watchlist(aa_rows: list[dict], top_n: int = WATCHLIST_TOP_N,
-                     max_fanout: float = MAX_FANOUT,
                      max_spread: int = MAX_CREATOR_SPREAD,
                      head_ratio: float = HEAD_RATIO) -> list[str]:
     """从 AA 榜单前 top_n 名的模型名里派生关键词，四条度量判据 + 贪心覆盖。
 
     候选词与命中都走 runs_hit 的**整词边界**（见 norm_runs）：'sol' 量出来只覆盖 GPT-6 Sol
-    一族，不再被 'Solar Mini 4' 撑宽，所以扇出/离散度这两条判据量的是真宽度。
+    一族，不再被 'Solar Mini 4' 撑宽，所以离散度这条判据量的是真宽度。
 
-    · 长度 ≥3 且含字母 —— 纯版本号 token（'6'、'5.5'）没有字母，本来就不是身份词；
-      而 'sol'、'glm' 这种 3 字母产品名必须留下，用 ≥4 会把名次 #16/#25 的家族整个丢掉；
-    · 行扇出 ≤ max_fanout —— 太宽的词（'gpt'/'claude'/'openai'）丢掉；
+    · 候选只取字母段（≥3；'Hy4' 这种两字母连写家族收 'hy'）—— 纯数字段（'6'、'5.5'）
+      不是身份词；'模型+版本' 的两段词只在覆盖兜底时出现，不参与主轮；
+    · 厂商离散度 ≤ max_spread（默认 1）—— 关键词必须是某一家独有的命名段；
+      'max'(9 家)、'flash'(6 家)、'pro'(3 家) 这类档位/通用词自然出局，不需要人列黑名单。
+      **不按命中行数设上限**：'gpt'/'claude' 行数再多也是同一家，踢掉它们等于新代次
+      一换代号就漏（Claude 6、GPT-7 没有新代号就进不了表）；
       注意**不按词性判断**，先前"排除厂商名"想把 'kimi' 整族误杀了，因为 Kimi 的
       creator 就叫 Kimi、产品名与厂商同名；
-    · 厂商离散度 ≤ max_spread —— 'max'(9 家)、'flash'(6 家)、'pro'(3 家) 这类档位/通用词
-      自然出局，不需要人列黑名单；
     · 命名主体占比 ≥ head_ratio —— 'fallback'/'with' 只出现在 "(high with fallback)"
       这种档位后缀里（主体占比 0.00），不该当关键词；
     · 贪心覆盖：宽词优先（族名比单个变体名活得久），且每个词必须至少**新覆盖**一条
-      前 N 名的行，否则是冗余词。上一版按这个规则跑出来是 15 个词、匹配 77 行，
-      与手写的 21 个词覆盖完全同一批行 —— 少掉的都是 'v2.6'/'a95b' 这类被族名盖住的变体词。
+      前 N 名的行，否则是冗余词。同覆盖数时先取「命名首段」（`mistral` 胜过 `large`、
+      `kimi` 胜过 `k3.1`），再取更短的词；
+      上一版按这个规则跑出来是 15 个词、匹配 77 行，与手写的 21 个词覆盖完全同一批行。
 
     AA 主表通常按智能指数降序，但**不靠页面顺序**：内在排序由 rank_order 按分数重排，
     并列按竞赛式名次整体纳入（见 competition_ranks），所以同分的模型要么一起进、要么一起出。
@@ -1953,25 +2356,38 @@ def derive_watchlist(aa_rows: list[dict], top_n: int = WATCHLIST_TOP_N,
     if not aa_rows:
         return []
     within = rows_within_rank(aa_rows, top_n)
-    cands = {t for i in within for t in tokens_list(aa_rows[i]["name"])
-             if len(t) >= 3 and re.search(r"[a-z]", t)}
-    stats = token_stats(aa_rows, cands)
-    fan_limit = max(4, int(len(aa_rows) * max_fanout))
+    one: set[str] = set()
+    two: set[str] = set()
+    for i in within:
+        a, b = _segment_candidates(aa_rows[i]["name"])
+        one |= a
+        two |= b
+    stats_one = token_stats(aa_rows, one)
+    stats_two = token_stats(aa_rows, two - one)
+    stats = {**stats_two, **stats_one}
     allowed = {t: v for t, v in stats.items()
-               if len(v[0]) <= fan_limit and v[1] <= max_spread and v[2] >= head_ratio}
+               if v[1] <= max_spread and v[2] >= head_ratio}
+    # 命名首段：'Mistral Large 4' 里 mistral 在首位、large 在第二位。
+    # 同覆盖数时先选首段，避免 'large' 这类尺寸词靠"更短"抢掉厂商名。
+    firsts = [(segments(r["name"]) or [""])[0] for r in aa_rows]
+    lead = {t: firsts.count(t) for t in allowed}
 
     need = set(within)
     kept: list[str] = []
-    for t in sorted(allowed, key=lambda x: (-len(allowed[x][0]), x)):
+    # 主轮只发单段家族词：一种词形，换厂商也不用换组合方式。
+    for t in sorted((t for t in allowed if t in stats_one),
+                    key=lambda x: (-len(allowed[x][0]), -lead[x], len(x), x)):
         new = allowed[t][0] & need
         if new:
             kept.append(t)
             need -= new
     # 判据太严导致有行没被覆盖时，用该行能用的最窄词兜住 —— 覆盖前 N 名是硬要求，
     # 宁可多一个宽词，也不能让某个模型静默掉出表（那正是这次要修的毛病）。
+    # 这里才允许两段版本词（'模型+版本'），且只补主流没盖住的行。
     for i in sorted(need):
         own = sorted((t for t in stats if i in stats[t][0]),
-                     key=lambda t: (len(stats[t][0]), stats[t][1], t))
+                     key=lambda t: (len(stats[t][0]), -lead.get(t, 0),
+                                    1 if t in stats_two else 0, len(t), t))
         if own:
             kept.append(own[0])
     return sorted(set(kept))
@@ -1991,9 +2407,8 @@ def _watchlist_meta(aa_rows: list[dict], top_n: int, derived: list[str],
     meta = {
         "at": now_str(), "mode": mode, "top_n": top_n,
         "derived_count": len(derived), "added": added,
-        "criteria": {"max_fanout": MAX_FANOUT, "max_creator_spread": MAX_CREATOR_SPREAD,
-                     "head_ratio": HEAD_RATIO, "fan_limit": max(4, int(len(aa_rows) * MAX_FANOUT)),
-                     "rows_total": len(aa_rows)},
+        "criteria": {"max_creator_spread": MAX_CREATOR_SPREAD,
+                     "head_ratio": HEAD_RATIO, "rows_total": len(aa_rows)},
         "words": {t: {"rows": len(h), "creators": sp, "head": hd}
                   for t, (h, sp, hd) in token_stats(aa_rows, set(derived)).items()},
     }
@@ -2163,6 +2578,7 @@ def merge(aa_rows: list[dict], or_models: dict, dl_rows: list[dict],
             "price_source": price_source,
             "or_id": orr.get("id"),
             "or_modalities": orr.get("modalities") or [],
+            # models.dev 只作参考目录。保留它的值用于比较，不替换 OpenRouter 计费观测。
             "models_dev": orr.get("models_dev"),
             "dl_index": dl_index.get(frozenset(tokens(row["name"]) | tokens(row["creator"]))),
         }
@@ -4003,31 +4419,84 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
     dl_rows: list[dict] = []
     usage: dict[str, dict] = {}
     usage_meta: dict = {}
-    progress_rows: list[dict] = []
-    progress_version = None
+    # Progress v1 全量包已 404；先加载冻结基线，官网能取到当页 28 行时再用官方行覆盖。
+    progress_baseline, progress_model = load_progress_artifacts()
+    progress_rows: list[dict] = progress_baseline
+    progress_version = "v1" if progress_baseline else None
+    progress_official = False
+    progress_snapshot = False
     task_rows: list[dict] = []
     con = ensure_db()
 
     if SRC_AA in sources:
         log("开始抓取 AA 榜单")
+        page = None
+        fetched_rows = None
+        version = None
+        aa_error = None
         try:
             with network_budget(SOURCE_NETWORK_BUDGET):
                 page = fetch(SOURCES[SRC_AA]).decode("utf-8", "ignore")
-                # 保留完整公开输入，未来可以按原轮次重解析，不用后来读数替代历史。
-                save_snapshot(con, "aa_html", 1, True, None, [{"html": page}])
-                con.commit()
                 fetched_rows = parse_aa(page)
-                version = evaluation_version(fetch(AA_METHODOLOGY).decode("utf-8", "ignore"))
+                try:
+                    version = evaluation_version(fetch(AA_METHODOLOGY).decode("utf-8", "ignore"))
+                except Exception:  # noqa: BLE001 —— 方法页也允许无头兜底
+                    if not chrome_binary():
+                        raise
+                    version = evaluation_version(
+                        fetch_rendered_page(AA_METHODOLOGY).decode("utf-8", "ignore"))
+        except Exception as exc:  # noqa: BLE001
+            aa_error = exc
+            if not chrome_binary():
+                log(f"AA 直连/解析失败：{exc}；无头兜底未启用/不可用，保留原错误")
+            else:
+                log(f"AA 直连/解析失败：{exc}；尝试无头浏览器渲染")
+                try:
+                    with network_budget(SOURCE_NETWORK_BUDGET):
+                        page = fetch_rendered_page(SOURCES[SRC_AA]).decode("utf-8", "ignore")
+                        fetched_rows = parse_aa(page)
+                        try:
+                            version = evaluation_version(fetch(AA_METHODOLOGY).decode("utf-8", "ignore"))
+                        except Exception:  # noqa: BLE001
+                            if not chrome_binary():
+                                raise
+                            version = evaluation_version(
+                                fetch_rendered_page(AA_METHODOLOGY).decode("utf-8", "ignore"))
+                    log("AA 无头浏览器渲染成功")
+                except Exception as exc2:  # noqa: BLE001
+                    aa_error = RuntimeError(f"{exc}（无头兜底失败：{exc2}）")
+                    log(f"AA 无头浏览器也失败：{exc2}")
+        # 直连页面能解析但内嵌耗时被客户端渲染掉时，再用无头补一次；主路径仍是直连。
+        if fetched_rows and version:
+            coverage = inline_time_coverage(fetched_rows)
+            if (coverage < AA_INLINE_MIN_RATIO and chrome_binary()
+                    and has_inline_time_schema(fetched_rows)):
+                log(f"AA 内嵌耗时覆盖 {coverage:.0%} 低于阈值，尝试无头浏览器补位")
+                try:
+                    with network_budget(SOURCE_NETWORK_BUDGET):
+                        browser_page = fetch_rendered_page(SOURCES[SRC_AA]).decode("utf-8", "ignore")
+                        browser_rows = parse_aa(browser_page)
+                    browser_coverage = inline_time_coverage(browser_rows)
+                    if browser_coverage > coverage:
+                        page, fetched_rows = browser_page, browser_rows
+                        log(f"AA 无头补位成功：内嵌耗时 {browser_coverage:.0%}")
+                except Exception as exc3:  # noqa: BLE001
+                    log(f"AA 无头补位失败：{exc3}")
+        if fetched_rows and version:
+            # 保留完整公开输入，未来可以按原轮次重解析，不用后来读数替代历史。
+            save_snapshot(con, "aa_html", 1, True, None, [{"html": page}])
+            con.commit()
             for r in fetched_rows:
                 r["evaluation_version"] = version
             aa_rows = fetched_rows
             status[SRC_AA] = {"ok": True, "n": len(aa_rows), "ts": now_str(), "url": SOURCES[SRC_AA]}
             status[SRC_AA]["evaluation_version"] = version
             save_snapshot(con, SRC_AA, len(aa_rows), True, None, aa_rows)
-            log(f"AA 榜单 OK：{len(aa_rows)} 行")
-        except Exception as exc:  # noqa: BLE001
-            status[SRC_AA] = {"ok": False, "err": str(exc), "ts": now_str(), "url": SOURCES[SRC_AA]}
-            log(f"AA 抓取失败：{exc}")
+            log(f"AA 榜单 OK：{len(aa_rows)} 行（内嵌耗时 {inline_time_coverage(aa_rows):.0%}）")
+        else:
+            status[SRC_AA] = {"ok": False, "err": str(aa_error or "AA 页面解析为空"),
+                              "ts": now_str(), "url": SOURCES[SRC_AA]}
+            log(f"AA 抓取失败：{aa_error}")
             # 降级到最近一次成功的 AA 快照。AA 是主源，index / apt_usd / tok_s / ttft_s 全靠它，
             # 挂掉时绝不能退化成「只出 OpenRouter 价格行」——那会造出一批能力指标全为 None 的
             # 伪模型，散点图和图例因此全空、表格却塞满 70 多行没用的东西，比没数据更糟。
@@ -4053,32 +4522,101 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
                     log("Progress 数据包不唯一，重取一次页面再判")
                     page = fetch(SOURCES[SRC_PROGRESS]).decode("utf-8", "ignore")
                     progress_rows, progress_version = parse_progress(page)
+            progress_official = True
             status[SRC_PROGRESS] = {"ok": True, "n": len(progress_rows), "ts": now_str(),
-                                    "url": SOURCES[SRC_PROGRESS], "evaluation_version": progress_version}
+                                    "url": SOURCES[SRC_PROGRESS], "evaluation_version": progress_version,
+                                    "official": True}
             save_snapshot(con, SRC_PROGRESS, len(progress_rows), True, None, progress_rows)
             log(f"Progress v{progress_version} OK：{len(progress_rows)} 个型号档位")
         except Exception as exc:
-            status[SRC_PROGRESS] = {"ok": False, "err": str(exc), "ts": now_str(), "url": SOURCES[SRC_PROGRESS]}
-            log(f"Progress 抓取失败：{exc}（不使用旧分数补齐）")
+            progress_official = False
+            old_rows, observed = last_good_snapshot(con, SRC_PROGRESS)
+            if old_rows:
+                # 旧官方快照比冻结基线更贴近本机台账；仍用基线补锚点与新增型号。
+                progress_rows = old_rows
+                progress_snapshot = True
+                row = con.execute(
+                    "SELECT evaluation_version FROM snapshots WHERE source=? AND ts=? AND ok=1",
+                    (SRC_PROGRESS, observed)).fetchone()
+                progress_version = row[0] if row and row[0] else progress_version
+                status[SRC_PROGRESS] = {"ok": True, "n": len(progress_rows), "ts": now_str(),
+                                        "url": SOURCES[SRC_PROGRESS], "evaluation_version": progress_version,
+                                        "official": False, "from_snapshot": True, "stale": True,
+                                        "from": observed, "note": "官网加密包不可用；使用旧官方快照"}
+                log(f"Progress 官网不可用：{exc}；沿用 {observed} 的官方快照 {len(progress_rows)} 行")
+            elif progress_rows:
+                status[SRC_PROGRESS] = {"ok": True, "n": len(progress_rows), "ts": now_str(),
+                                        "url": SOURCES[SRC_PROGRESS], "evaluation_version": progress_version,
+                                        "official": False, "baseline": True,
+                                        "note": "官网加密包不可用；使用冻结 v1 基线"}
+                log(f"Progress 官网不可用：{exc}；使用冻结 v1 基线 {len(progress_rows)} 行")
+            else:
+                status[SRC_PROGRESS] = {"ok": False, "err": str(exc), "ts": now_str(),
+                                        "url": SOURCES[SRC_PROGRESS]}
+                log(f"Progress 抓取失败：{exc}（无基线可用）")
 
+    # 版本只认 AA 官方当前方法，不从 Progress 或抓取日期推断。
+    task_version = status.get(SRC_AA, {}).get("evaluation_version")
+    # 同一张榜单页里的当前版本读数；AA 降级沿用旧快照时不可用作新版时间。
+    inline_rows = (inline_task_rows(aa_rows, task_version)
+                   if aa_rows and not status.get(SRC_AA, {}).get("stale") else [])
+    task_source = None
     if SRC_AA_TIMES in sources:
         log("开始抓取 AA 每任务耗时")
-        try:
-            with network_budget(SOURCE_NETWORK_BUDGET):
-                page = fetch_task_manifest(SOURCES[SRC_AA_TIMES]).decode("utf-8", "ignore")
-                task_rows = parse_task_times(page)
-            # 版本只认 AA 官方当前方法，不从 Progress 或抓取日期推断。
-            task_version = status.get(SRC_AA, {}).get("evaluation_version")
-            for r in task_rows:
-                r["evaluation_version"] = task_version
-            status[SRC_AA_TIMES] = {"ok": True, "n": len(task_rows), "ts": now_str(),
-                                    "url": SOURCES[SRC_AA_TIMES], "evaluation_version": task_version}
+        # 1) 新 V2 API（需要 Pro/Commercial key；Free key 不含 time per task）
+        if aa_api_key() and not status.get(SRC_AA, {}).get("stale"):
+            try:
+                with network_budget(SOURCE_NETWORK_BUDGET):
+                    task_rows, api_tier, api_version = fetch_aa_api_models(task_version)
+                task_source = "api"
+                status[SRC_AA_TIMES] = {
+                    "ok": True, "n": len(task_rows), "ts": now_str(),
+                    "url": AA_API_MODELS, "source": "api",
+                    "tier": api_tier, "api_version": api_version,
+                    "evaluation_version": task_version,
+                    "note": "V2 API 提供 performance_v3.time_per_task_seconds；"
+                            "每任务 output token 由 时间×mean speed 派生",
+                }
+                save_snapshot(con, SRC_AA_TIMES, len(task_rows), True, None, task_rows)
+                log(f"AA 每任务耗时 OK：{len(task_rows)} 行"
+                    f"（V2 API tier={api_tier}，版本 {task_version or '未知'}）")
+            except Exception as exc:  # noqa: BLE001
+                log(f"AA V2 API 未取到每任务耗时：{exc}；改用榜单页内嵌同版读数")
+        # 2) 榜单页 initialModels 内嵌读数（无 key 也能用，随评测版本自动更新）
+        if not task_rows and inline_rows:
+            task_rows = inline_rows
+            task_source = "inline"
+            status[SRC_AA_TIMES] = {
+                "ok": True, "n": len(task_rows), "ts": now_str(),
+                "url": SOURCES[SRC_AA], "source": "inline", "fallback": "inline",
+                "partial": True, "evaluation_version": task_version,
+                "note": "AA V2 API 未配置或未返回 time per task；"
+                        "已用榜单页内嵌同版读数，缺失留空不估算；"
+                        "每任务 output token 由 时间×该源速度 派生",
+            }
             save_snapshot(con, SRC_AA_TIMES, len(task_rows), True, None, task_rows)
-            log(f"AA 每任务耗时 OK：{len(task_rows)} 行（版本 {task_version or '未知'}）")
-        except Exception as exc:  # noqa: BLE001
-            status[SRC_AA_TIMES] = {"ok": False, "err": str(exc), "ts": now_str(),
-                                    "url": SOURCES[SRC_AA_TIMES]}
-            log(f"AA 每任务耗时抓取失败：{exc}（值留空，不估算）")
+            log(f"AA 每任务耗时：榜单页内嵌读数 {len(task_rows)} 档（未用旧 manifest）")
+        # 3) 旧 /data/<hash>.txt 加密 manifest：上游已 404，只留最后兜底
+        if not task_rows:
+            try:
+                with network_budget(SOURCE_NETWORK_BUDGET):
+                    page = fetch_task_manifest(SOURCES[SRC_AA_TIMES]).decode("utf-8", "ignore")
+                    task_rows = parse_task_times(page)
+                for r in task_rows:
+                    r["evaluation_version"] = task_version
+                task_source = "legacy"
+                status[SRC_AA_TIMES] = {"ok": True, "n": len(task_rows), "ts": now_str(),
+                                        "url": SOURCES[SRC_AA_TIMES], "source": "legacy",
+                                        "evaluation_version": task_version}
+                save_snapshot(con, SRC_AA_TIMES, len(task_rows), True, None, task_rows)
+                log(f"AA 每任务耗时 OK：{len(task_rows)} 行"
+                    f"（旧 manifest，版本 {task_version or '未知'}）")
+            except Exception as exc:  # noqa: BLE001
+                status[SRC_AA_TIMES] = {"ok": False, "err": str(exc), "ts": now_str(),
+                                        "url": SOURCES[SRC_AA_TIMES], "source": "none"}
+                if "404" in str(exc):
+                    log("旧 /data/*.txt 加密包已 404；AA 的新出口是 V2 API 或榜单页内嵌读数")
+                log(f"AA 每任务耗时抓取失败：{exc}（值留空，不估算）")
 
     if SRC_OR in sources:
         log("开始抓取 OpenRouter 报价")
@@ -4171,6 +4709,10 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
     for source in (SRC_PROGRESS, SRC_AA_TIMES):
         if source not in status or status[source].get("ok"):
             continue
+        if source == SRC_AA_TIMES and task_rows:
+            # 本轮已有 API/榜单页内嵌的同版读数，旧快照不能覆盖它：
+            # 旧版时间混进新版正是版本门要挡的事。
+            continue
         rows, observed = last_good_snapshot(con, source)
         if not rows:
             continue
@@ -4234,35 +4776,74 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
 
     # 被撤下但没被"全面优于"的行沿用回来（判据见 carry_forward）：换版不等于旧模型没价值。
     n_carry = carry_forward(models, con, or_models, dl_rows, cfg, now_str())
-    n_prev = carry_from_payload(models, carry_from, now_str()) if not status.get(SRC_AA, {}).get("stale") else 0
+    n_prev = (carry_from_payload(models, carry_from, now_str())
+              if not status.get(SRC_AA, {}).get("stale") else 0)
     if n_prev:
         log(f"沿用公开站上一版 {n_prev} 行：上一版有、本轮榜上已撤，评测版本一致才带回来")
     if n_carry:
         log(f"沿用 {n_carry} 行：被榜单撤下但评测版本没变，按最后一次实测值带回来，"
              f"显式标「沿用 日期」，最长 {CARRY_MAX_DAYS} 天（with fallback 重复档不带回）")
 
-    progress_matched = attach_progress(models, progress_rows,
-                                      progress_version)
-    if models and not status.get(SRC_AA, {}).get("stale") and status.get(SRC_PROGRESS, {}).get("ok") and not progress_matched:
-        status[SRC_PROGRESS].update(ok=False, err="Progress 数据包与当前模型零匹配")
+    official_matched = (attach_progress(models, progress_rows, progress_version)
+                        if (progress_official or progress_snapshot) and progress_rows else 0)
+    baseline_matched = (attach_progress(models, progress_baseline, "v1", only_missing=True)
+                        if progress_baseline else 0)
+    calibrated = calibrate_progress(models, progress_model)
+    mark_progress_anchors(models, progress_baseline)
+    progress_matched = official_matched + baseline_matched + calibrated
+    anchors = sum(1 for m in models if m.get("progress_anchor"))
+    if models and not status.get(SRC_AA, {}).get("stale") and not progress_matched:
+        status.setdefault(SRC_PROGRESS, {}).update(ok=False, err="Progress 基线与当前模型零匹配")
     if SRC_PROGRESS in status:
-        status[SRC_PROGRESS]["matched"] = progress_matched
+        status[SRC_PROGRESS].update(
+            matched=progress_matched, official_matched=official_matched,
+            baseline_matched=baseline_matched, estimated=calibrated, anchors=anchors,
+            baseline=bool(progress_baseline), baseline_n=len(progress_baseline),
+            model=(progress_model or {}).get("version"),
+            model_metrics=(progress_model or {}).get("metrics"),
+            model_trained_on=(progress_model or {}).get("trained_on"),
+        )
     if SRC_PROGRESS in sources:
-        log(f"Progress 精确匹配 {progress_matched}/{len(models)} 档；缺失不记零")
+        log(f"Progress 匹配 {progress_matched}/{len(models)} 档"
+            f"（官方 {official_matched} / 基线 {baseline_matched} / 校准 {calibrated}；锚点 {anchors}）")
 
     task_matched = attach_task_times(
         models,
         task_rows,
         status.get(SRC_AA, {}).get("evaluation_version"))
+    if task_matched == 0 and task_source == "api" and inline_rows:
+        # API 的 slug/name 形状变了也不该把整列打空：同页内嵌读数是同版本的，
+        # 用它重试一次；仍然只填能唯一匹配的档。
+        log("V2 API 与当前模型零匹配，退回榜单页内嵌读数再试")
+        task_rows = inline_rows
+        task_source = "inline"
+        status[SRC_AA_TIMES] = {
+            "ok": True, "n": len(task_rows), "ts": now_str(),
+            "url": SOURCES[SRC_AA], "source": "inline", "fallback": "inline",
+            "partial": True,
+            "evaluation_version": status.get(SRC_AA, {}).get("evaluation_version"),
+            "note": "V2 API 与当前模型零匹配；已用榜单页内嵌同版读数，缺失留空不估算；"
+                    "每任务 output token 由 时间×该源速度 派生",
+        }
+        save_snapshot(con, SRC_AA_TIMES, len(task_rows), True, None, task_rows)
+        task_matched = attach_task_times(
+            models, task_rows, status.get(SRC_AA, {}).get("evaluation_version"))
     if SRC_AA_TIMES in status:
         status[SRC_AA_TIMES]["matched"] = task_matched
+        # 旧快照版本不符时 matched=0，stale=True 会让看板误读成“沿用了旧时间”。
+        if status[SRC_AA_TIMES].get("stale") and not task_matched:
+            base_err = status[SRC_AA_TIMES].get("err") or ""
+            status[SRC_AA_TIMES].update(
+                stale=False,
+                err=(base_err + "；" if base_err else "") + "旧快照版本不符，未采用")
         # 包解析成功但一行都没匹配上，不是“成功且没数据”：源状态必须下来。
         if status[SRC_AA_TIMES].get("ok") and not task_matched:
             status[SRC_AA_TIMES].update(ok=False, err="每任务耗时数据包与当前模型零匹配")
     if SRC_AA_TIMES in sources:
         log(f"每任务耗时精确匹配 {task_matched}/{len(models)} 档；缺失留空，不估算")
         n_tokens = sum(1 for m in models if m.get("output_tokens_per_task"))
-        log(f"每任务输出量匹配 {n_tokens}/{len(models)} 档；缺时间时用它 ÷ 速度派生")
+        log(f"每任务输出量 {n_tokens}/{len(models)} 档（内嵌/API 按 时间×速度 派生；"
+            f"缺时间时用它 ÷ 速度）")
 
     n_carry_progress, n_carry_time = restore_carried_metrics(models, con, progress_version)
     if n_carry_progress or n_carry_time:
@@ -4413,6 +4994,30 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
     sub_note = ("另有源缺失：" + "、".join(
                     f"{SRC_LABEL.get(s, s)}（{str(status[s].get('err', ''))[:40]}）"
                     for s in missing)) if missing else ""
+    partial = [s for s in (SRC_PROGRESS, SRC_AA_TIMES)
+               if status.get(s, {}).get("partial")]
+    partial_note = ("部分源为同版部分数据：" + "、".join(
+                        f"{SRC_LABEL.get(s, s)}（{str(status[s].get('note', ''))[:60]}）"
+                        for s in partial)) if partial else ""
+    progress_status = status.get(SRC_PROGRESS, {})
+    progress_note = ""
+    if progress_status and (progress_status.get("estimated") or not progress_status.get("official", True)):
+        metrics = progress_status.get("model_metrics") or {}
+        if progress_status.get("official"):
+            progress_note = (
+                "Progress v1 官方 766；"
+                f"{progress_status.get('estimated', 0)} 个新模型按 AA Index 校准估计"
+                f"（MAE {metrics.get('mae', '?')}），"
+                f"{progress_status.get('anchors', 0)} 个 /trends 锚点"
+            )
+        else:
+            progress_note = (
+                "Progress v1 官网不可用；"
+                f"{progress_status.get('official_matched', 0) + progress_status.get('baseline_matched', 0)} 个用旧官方/基线，"
+                f"{progress_status.get('estimated', 0)} 个 AA Index 校准估计"
+                f"（MAE {metrics.get('mae', '?')}），"
+                f"{progress_status.get('anchors', 0)} 个 /trends 锚点"
+            )
     payload = {
         "generated_at": aa_status.get("from") if aa_status.get("stale") else now_str(),
         "sources": status,
@@ -4469,7 +5074,17 @@ def run(sources: list[str], with_logos: bool, carry_from: dict | None = None) ->
                        if aa_status.get("stale")
                        else "AA 源本次抓取失败，且本地没有可用快照，能力指标全部缺失"
                        if not aa_status.get("ok") and not models
-                       else ""), sub_note) if x),
+                       else ""), progress_note, sub_note, partial_note) if x),
+        "progress_contract": {
+            "version": (progress_model or {}).get("version"),
+            "features": (progress_model or {}).get("features", []),
+            "baseline": bool(progress_baseline),
+            "official": progress_official,
+            "from_snapshot": progress_snapshot,
+            "anchors": anchors,
+            "estimated": calibrated,
+            "aliases": {"intelligenceIndex": ["intelligenceIndex", "index"]},
+        },
     }
     payload["last_moves"] = last_moves
     payload["prev_moves"] = prev_moves      # 强制往前翻那一路（本轮有变动时也看得到上次那批）

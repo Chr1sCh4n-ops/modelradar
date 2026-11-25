@@ -1,0 +1,1367 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ModelRadar · 速度与成本性价比定位</title>
+<style>
+  :root{
+    --bg:#0b0f16; --panel:#121823; --panel2:#161e2b; --line:#232c3b;
+    --fg:#e6edf3; --dim:#8b98a9; --dim2:#5d6a7d;
+    --accent:#5aa9ff; --gold:#e3b341;
+  }
+  *{box-sizing:border-box}
+
+  /* 露白的真正元凶在这里：背景只写在 body 上，html 没有背景色，
+     滚动条/滚动区露出的就是 html 的底色（浏览器默认白）。 */
+  html{background:var(--bg);scrollbar-color:#2f3b4d #121823}
+
+  /* ---- 深色滚动条 ----
+     坑：一旦给 ::-webkit-scrollbar 显式尺寸，track 的默认底色就是浅色，
+     webview 里写 background:transparent 等于直接露出白底。
+     所以 scrollbar / track / thumb / corner 四层都要给明确的深色。
+     滑块变细靠「同色边框」而不是 background-clip:content-box（后者同样会露底）。 */
+  *{scrollbar-width:thin;scrollbar-color:#2b3648 #121823}   /* thumb   track */
+  ::-webkit-scrollbar        {width:10px;height:10px;background:#121823}
+  ::-webkit-scrollbar-track  {background:#121823}
+  ::-webkit-scrollbar-corner {background:#121823}
+  ::-webkit-scrollbar-thumb  {background:#2f3b4d;border:2px solid #121823;
+                              border-radius:6px}
+  ::-webkit-scrollbar-thumb:hover,
+  ::-webkit-scrollbar-thumb:active{background:#46566d}
+
+  /* 悬停高亮：与 render_scatter_svg.HOVER_CSS 同一份，勿改一边 */
+  .mk{cursor:pointer}
+  .mk.hi circle{stroke-width:2.2;stroke-opacity:1}
+  /* 沿用回来的行平时半透明（读数旧、只是给个上下文），指到就恢复正常不透明度：
+     高亮状态必须能读准，否则"点进去了还是灰的"会被当成没数据。 */
+  .mk.carr{opacity:.6}
+  .mk.carr.hi{opacity:1}
+  .ln{transition:none}
+  .ln.hi{stroke-width:2.4;stroke-opacity:1}
+
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 20px 60px}
+
+  /* ---- 顶部条 ---- */
+  .top{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+  .top h1{font-size:16px;margin:0;letter-spacing:.3px;font-weight:600}
+  .top h1 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:8px;vertical-align:middle}
+  .top .meta{color:var(--dim);font-size:11.5px}
+  .top .meta b{color:var(--fg);font-weight:600}
+  .top .spacer{flex:1}
+  .srcs{display:flex;gap:7px;flex-wrap:wrap}
+  .src{display:flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--line);
+       border-radius:20px;padding:3px 10px;font-size:11px}
+  .src i{width:6px;height:6px;border-radius:50%;background:#2fbf71;display:block}
+  .src.bad i{background:#f0523f}
+  .src.warn i{background:var(--gold)}
+  .src span{color:var(--dim)}
+  .src.warn span{color:var(--gold)}
+
+  /* 主源降级横幅：图能看，但数据是旧的时候必须说清楚，
+     否则用户会把 1 小时前的数据当成实时值去决策。 */
+  .banner{display:flex;gap:9px;align-items:flex-start;background:#2a2210;border:1px solid #5c4a1a;
+          border-left:3px solid var(--gold);border-radius:9px;padding:10px 13px;margin-bottom:14px;
+          font-size:12px;line-height:1.6;color:#e8d9a8}
+  .banner b{color:var(--gold)}
+  .banner .x{margin-left:auto;cursor:pointer;color:#8b98a9;font-size:14px;line-height:1;flex:none}
+  .banner .x:hover{color:var(--fg)}
+
+  /* 真的没数据时的空状态，别留一片空白让人以为是加载卡住 */
+  .void{display:flex;flex-direction:column;gap:7px;align-items:center;justify-content:center;
+        min-height:230px;text-align:center;color:var(--dim2);font-size:12.5px;line-height:1.7}
+  .void b{color:var(--dim);font-size:13px}
+  label.ck{display:flex;gap:5px;align-items:center;color:var(--dim);cursor:pointer;font-size:11.5px}
+  /* hidden 必须显式压过 label.ck 的 display:flex，否则"仅任务模式可见"的开关一直占位 */
+  label.ck[hidden]{display:none}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+  .card h2{font-size:12px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.5px}
+  .note{color:var(--dim2);font-size:11px;margin-top:8px;line-height:1.6}
+  .note b{color:var(--dim);font-weight:600}
+
+  /* ---- 图例：圆形 = TPS 大小，填厂商主题色，中间嵌模型图标 ---- */
+  .legend{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:flex-end}
+  .lg{display:flex;flex-direction:column;align-items:center;gap:5px;width:58px}
+  .lg .ring{border-radius:50%;display:flex;align-items:center;justify-content:center;overflow:hidden;
+            border:1.5px solid rgba(255,255,255,.22);box-shadow:0 0 0 2px rgba(0,0,0,.28)}
+  /* icon 100% 铺满圆，不留边框留白。
+     SVG 自带的内边距去不掉（<img> 拿不到内部结构），所以只能靠尺寸顶上去。 */
+  .lg .ring img{width:100%;height:100%;object-fit:contain;pointer-events:none;display:block}
+  .lg .ring .fallback{font:600 9px/1 -apple-system,sans-serif;letter-spacing:.5px}
+  .lg .cap{font-size:10px;color:var(--dim);text-align:center;line-height:1.2}
+  .lg .cap b{display:block;color:var(--fg);font-weight:600;font-size:11px}
+
+  /* ---- 折叠区 ---- */
+  details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:0 16px;margin-bottom:14px}
+  details[open]{padding-bottom:12px}
+  summary{cursor:pointer;padding:11px 0;font-size:12px;color:var(--dim);font-weight:600;letter-spacing:.5px;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"▸ ";color:var(--accent)}
+  details[open] summary::before{content:"▾ "}
+  summary:hover{color:var(--fg)}
+
+  .tools{display:flex;gap:12px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+  .filter{background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:7px;
+          padding:5px 9px;font-size:12px;min-width:170px}
+  .scroll{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:9px}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th,td{padding:7px 9px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px;
+     cursor:pointer;user-select:none;background:var(--panel2);position:sticky;top:0}
+  th:hover{color:var(--fg)}
+  th.sort::after{content:" ▾";color:var(--accent)}
+  tbody tr:hover{background:#ffffff06}
+  .mcell{display:flex;align-items:center;gap:8px}
+  .mcell img{width:1.15em;height:1.15em;object-fit:contain;flex:none}   /* 跟着行字号走，不写死 px */
+  .mcell .nm{font-weight:600}
+  .mcell .cr{color:var(--dim);font-size:11px;margin-left:2px}
+  .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:5px;background:#ffffff10;color:var(--dim);margin-left:6px}
+  .chg{display:flex;flex-wrap:wrap;gap:7px}
+  .chgbadge{display:flex;gap:7px;align-items:center;background:var(--panel2);border:1px solid var(--line);
+            border-radius:7px;padding:5px 10px;font-size:11.5px}
+  .chgbadge .mn{font-weight:600}
+  .chgbadge .fd{color:var(--dim)}
+  /* 归因标签：单价变了到底是"上游真变价"还是"换到了另一个目录条目" */
+  .chgbadge .tg{color:var(--dim2);border:1px solid var(--line);border-radius:5px;
+                padding:1px 5px;font-size:10px}
+  .up{color:#f0523f} .down{color:#2fbf71}
+  .empty{color:var(--dim2);font-size:11.5px}
+  /* 变动总结（可选）：有就把逐条明细收进悬停，卡片只留一段话 */
+  .sumline{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--gold);
+    border-radius:7px;padding:9px 11px;font-size:12.5px;line-height:1.65;cursor:help}
+  .sumtag{display:inline-block;margin-left:8px;color:var(--dim2);font-size:10.5px;white-space:nowrap}
+  a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<!-- 散点气泡共用的圆形裁剪：objectBoundingBox 下 0..1 恒为单位圆，
+     所以半径随 tok_s 变的气泡能共用同一个 clipPath，不必逐个生成。
+     放在页面级而不是散点 SVG 字符串里，免得污染"气泡数 = 模型数"这类结构判据。 -->
+<svg width="0" height="0" aria-hidden="true" style="position:absolute">
+  <defs><clipPath id="bubclip" clipPathUnits="objectBoundingBox">
+    <circle cx=".5" cy=".5" r=".5"/></clipPath></defs>
+</svg>
+<div class="wrap">
+
+  <div id="banner" style="display:none"></div>
+
+  <div class="top">
+    <h1><span class="dot"></span>ModelRadar</h1>
+    <div class="meta">速度 × 成本 × 性价比定位 · 抓取于 <b id="gen">—</b></div>
+    <div class="spacer"></div>
+    <div class="srcs"></div>
+    <label class="ck"><input type="checkbox" id="autor" checked /> 60s 自动刷新</label>
+  </div>
+
+  <div class="card">
+    <h2>数据源状态</h2>
+    <div class="srcs"></div>
+  </div>
+
+  <!-- 主视觉：速度与成本性价比定位 -->
+  <div class="card">
+    <h2 id="scatter-title">速度与成本性价比定位图</h2>
+    <div class="tools">
+      <label class="ck"><input type="checkbox" id="sizebytask" role="switch" aria-checked="false" /> 圆面积：TPS / 任务耗时（越快越大）</label>
+      <label class="ck" id="penaltywrap" hidden><input type="checkbox" id="penalizelow" role="switch" aria-checked="false" /> 全局低分惩罚</label>
+    </div>
+    <div id="scatterwrap"></div>
+    <div class="note">
+      横轴 = 每任务成本（对数，越左越便宜）· 纵轴 = AA 智能指数（越上越强）·
+      <span id="size-caption">气泡面积 = 输出 tok/s（面积正比于速度，故半径取 √）</span> · <b>厂商同色细折线 = 同族同代次的档位能力线</b>（按推理档位固定顺序：non-reasoning / minimal / low / medium / high / xhigh / max，保留分数倒挂）·
+      <b style="color:var(--gold)">金色虚线 = Pareto 性价比前沿</b>，
+      线上的点「性能与成本两轴都没被别的模型同时超过」，只有看前沿才知道该选谁。最小的那一号气泡是<b>没测到 tok/s</b> 的占位，不代表它最慢。
+      双评分 = 智能指数 / 历史参照（AA Progress），版本随载荷，缺分为 —。
+      <b>虚线描边 + 外套同心环带的气泡 = 同族推估值</b>（不是实测，环带宽度 = 参照实测散布，表格里标「估」）：同一族的其它档已测、只缺这一档时，按智能指数在相邻两档之间插值；
+      这些点不参与 Pareto 前沿的计算。悬停可看它是怎么推的。
+      <b>中心只给一层淡色填充、外套环带的最小圆点 = 同级能力参照带</b>（表格里标「带」）：连同族也推不出时的兜底，只给「智能指数相邻的那些实测模型跑出的速度范围」，
+      <b>「沿用 MM-DD」= 这一行已被榜单撤下</b>，按最后一次实测值留在图上（判据：现役行里<b>没有任何一行</b>在
+      指数≥、每任务成本≤、速度≥ 三项上全面优于它——换版不等于旧模型没价值，实测例：新代次指数与成本更好、
+      速度却从 74 tok/s 掉到 51）。缺任一项就不能用来证明"全面优于"，所以缺数据的行不会被判为被取代；
+      最长沿用 30 天，过期即不再沿用。
+      <b>刻意不给中心值</b>——那是别家同级能力的分布，不是这个模型的估计；同样不参与前沿，也不进任何判据。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 id="legend-title">图例 · 按智能梯队排列，同梯队内按离 Pareto 前沿的距离 · 圆越大越快</h2>
+    <div class="legend" id="legend"></div>
+    <div class="note">排序键由爬虫算好（梯队 = 按智能指数分档；同档内离金线越近越靠前），
+      前端只按 <code>cap_band</code> / <code>dist_front</code> 排，不自己算支配关系。
+      圆的背景色取自各自 logo 里探测出的真实品牌色（如阿里 #FF5A00、深度求索 #4D6BFE），
+      不再用手填；白底黑字那种自带对比的图标则沿用其自带背景。</div>
+  </div>
+
+  <div class="card">
+    <h2>最近一次抓取的变动</h2>
+    <div class="chg" id="changes"><span class="empty">载入中…</span></div>
+    <div class="note">和上一次抓取逐字段比对，霓虹红 = 上升，绿 = 下降。</div>
+  </div>
+
+  <details>
+    <summary>完整数据表（可排序 / 过滤）</summary>
+    <div class="tools">
+      <input class="filter" id="q" placeholder="过滤模型名 / 厂商 / OpenRouter id…" />
+      <label class="ck"><input type="checkbox" id="onlycn" /> 只看国产</label>
+    </div>
+    <div class="scroll">
+      <table id="tbl">
+        <thead><tr>
+          <th data-k="name">模型</th>
+          <th data-k="index" id="score-heading">智能指数 / 历史参照</th>
+          <th data-k="apt_usd">每任务成本 $</th>
+          <th data-k="time_per_task_s" title="官方口径：仅解码生成耗时估计，不含首块延迟（TTFT）与判分/PDF/OCR 等额外开销；官方缺失时按每任务输出量 ÷ 估计速度派生，显示为 ≈，区间来自速度参照带">任务耗时(估)</th>
+          <th data-k="think_s" title="≈ 总响应 − 500 / tok/s；含输入、排队等首回答前等待">思考时间</th>
+          <th data-k="think_ratio" title="思考时间 ÷ 任务耗时；为不同基准估计值之比，不是同一任务内的实测占比（非任务内时间分解），可能超过 100%">思考前摇</th>
+          <th data-k="tok_s">输出 tok/s</th>
+          <th data-k="ttft_s">首块延迟</th>
+          <th data-k="in_per_1m_usd">输入 $/1M</th>
+          <th data-k="out_per_1m_usd">输出 $/1M</th>
+          <th data-k="ctx">上下文</th>
+          <th data-k="or_id">OpenRouter id</th>
+        </tr></thead>
+        <tbody id="tb"></tbody>
+      </table>
+    </div>
+    <div class="note">口径：<b>智能指数 / 每任务成本 / tok-s / 首块延迟</b>来自 AA 榜单实测；
+      <b>输入输出单价</b>来自 OpenRouter 实时报价，与 AA 每任务成本不是同一口径。
+      跨版本分数不可比，AA 主指数 v4.3 后换过题本。<br>
+      任务耗时(估)为官方解码生成耗时估计，不含首块延迟（TTFT）与判分/PDF/OCR 等额外开销；<b>≈</b> 表示官方耗时缺失，由每任务输出量 ÷ 估计速度派生，区间来自速度参照带，不写历史；思考时间含输入/排队等首回答前等待；思考前摇 = 思考时间 ÷ 任务耗时；为不同基准估计值之比，非任务内时间分解，可能超过 100%。</div>
+  </details>
+
+</div>
+
+<script src="data/latest.js"></script>
+<!-- 变动总结（可选）。没有本机总结命令时这个文件根本不存在 → 404 是**正常状态**：
+     window.SUMMARY 缺席就让下面的变动卡退回显示表格，不打断渲染、不显示报错。
+     file:// 页面不能 fetch，所以只能靠 script 标签挂全局变量的方式拿。
+     ⚠️ 这段注释里不要写出真正的 script 起始标签：判据"内联脚本只能有一段"会把它当第二段
+     （踩过一次，症状是整个 verify 直接抛错、一条断言都跑不到）。 -->
+<script src="data/summary.js"></script>
+<script>
+(function(){
+  // MODEL_DATA 缺席 = <script src="data/latest.js"> 根本没加载成功（文件没了 / data 软链断了 /
+  // 不可读），这跟"抓到了但 models 为空"是两回事。分开记，是为了下面能说清"我不知道"，
+  // 而不是替一件没证据的事下结论。
+  const HAS_PAYLOAD = typeof window.MODEL_DATA === 'object' && window.MODEL_DATA !== null;
+  const D = window.MODEL_DATA || {};
+  const evaluationVersion = String(D.evaluation_version || '').replace(/^v/, '').replace(/\.0$/, '');
+  document.getElementById('scatter-title').textContent = '速度与成本性价比定位图'
+    + (evaluationVersion ? ` v${evaluationVersion}` : '');
+  const MODELS = D.models || [];
+  // ⚠️ 去尾零只能在**有小数点**时做。原先写的是 `.replace(/\.?0+$/,'')`，
+  // 而 d=0 时 toFixed(0) 产出的是纯整数串，于是把**有效**尾零也吃了：
+  // 90→"9"、100→"1"、150→"15"。tok/s 三处（图例 / 散点 tooltip / 表格）全用 d=0，
+  // 所以凡是整十的速度都显示错了 —— 底层数值和排序一直是对的（90 排在 92 与 86 之间），
+  // 只有显示被截，这才是最难发现的部分。
+  // 第二个坑：$0.0045 这类小于 10^-d 的成本会被 toFixed 压成 "0.00"→"0"，
+  // 于是 Luna(low) 显示成 "$0"。改成给两位有效数字。
+  const trimZeros = s => s.includes('.') ? s.replace(/0+$/,'').replace(/\.$/,'') : s;
+  const fmt = (v, d=2) => (v===null||v===undefined||v==="") ? "—"
+      : (Math.abs(v)>=1000 ? Number(v).toLocaleString('en-US',{maximumFractionDigits:0})
+         : (v!==0 && Math.abs(v) < 10**-d) ? trimZeros(Number(v.toPrecision(2)).toString())
+         : trimZeros((+v).toFixed(d)));
+  // AA Progress：只展示爬虫按「模型 × 推理档」精确匹配写下的值。缺分时明说不可用，
+  // 不能留空、更不能拿同族最高分补到别的档。
+  const metricNum = v => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  // 思考时间首选旧基准总响应反推；total_s 完全缺失时退回官方首回答延迟
+  // first_answer_s（它本身就是要表达的首回答前等待，不再减 500/tok）。
+  // total_s 有值但无效或矛盾时留空，不拿另一个口径掩盖对不上的数据。
+  const thinkOf = m => {
+    const total = metricNum(m.total_s);
+    if (total === null) {
+      const first = metricNum(m.first_answer_s);
+      return first !== null && first >= 0 ? first : null;
+    }
+    const tok = metricNum(m.tok_s);
+    if (total <= 0 || tok === null || tok <= 0) return null;
+    const value = total - 500 / tok;
+    return value < -1 ? null : Math.max(0, value);
+  };
+  // 时间格自带单位：不足 60 秒用 s，否则用 min；half-up 一位小数并去尾零。
+  // 先对秒做 half-up，再用同一个已舍入秒值判断门槛并换算分钟，与 Python 逐字一致。
+  // 负数、布尔、非有限数与字符串都算缺失。排序仍用原始秒值，不读这里的显示串。
+  const halfUp1 = v => Math.floor(v * 10 + 0.5) / 10;
+  const timeCell = v => {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return '—';
+    const seconds = halfUp1(v);
+    if (seconds < 60) return String(+(seconds).toFixed(1)) + 's';
+    return String(+(halfUp1(seconds / 60)).toFixed(1)) + 'min';
+  };
+  const speedCell = m => m.tok_s ? fmt(m.tok_s,0) + (m.tok_s_asof ? ` <span class="tag" title="${escT(m.tok_s_asof)}">沿用</span>` : '')
+    : (m.tok_s_est ? `<span class="dim">≈${fmt(m.tok_s_est,0)}</span> <span class="tag" title="${escT(m.tok_s_est_note)}">估</span>`
+    : (m.tok_s_band ? `<span class="dim">${m.tok_s_band[0]}–${m.tok_s_band[1]}</span> <span class="tag" title="${escT(m.tok_s_band_note)}">带</span>`
+                   : '—'));
+  // 思考前摇 = 思考时间 ÷ 任务耗时；为不同基准估计值之比，非任务内时间分解，
+  // 所以这里只做除法，不夹到 100%，也不拿任一侧的缺失去补另一侧。
+  const thinkRatioOf = m => {
+    const think = thinkOf(m), total = metricNum(m.time_per_task_s);
+    if (think === null || total === null || total <= 0) return null;
+    const value = think * 100 / total;
+    return Number.isFinite(value) ? value : null;
+  };
+  const thinkRatioCell = m => {
+    const v = thinkRatioOf(m);
+    return v === null ? '—' : halfUp1(v).toFixed(1).replace(/\.0$/, '') + '%';
+  };
+  // 整份数据都没有思考时间/思考前摇时，列与脚注口径一起撤掉：
+  // 留一列全是破折号，会被读成"每一档都实测为 0"。
+  const HAS_THINK = MODELS.some(m => thinkOf(m) !== null);
+  const HAS_RATIO = MODELS.some(m => thinkRatioOf(m) !== null);
+  for (const th of document.querySelectorAll('th[data-k]')) {
+    if ((th.dataset.k === 'think_s' && !HAS_THINK) || (th.dataset.k === 'think_ratio' && !HAS_RATIO))
+      th.hidden = true;
+  }
+  if (!HAS_THINK) {
+    // 脚注在明细表那张卡里，不是第一张卡的说明；按内容定位，别拿错元素。
+    const note = [...document.querySelectorAll('.note')]
+      .find(n => n.textContent.includes('思考前摇'));
+    if (note) note.innerHTML = note.innerHTML.replace(
+      '；思考时间含输入/排队等首回答前等待；思考前摇 = 思考时间 ÷ 任务耗时；为不同基准估计值之比，非任务内时间分解，可能超过 100%。', '。');
+  }
+  const progressText = m => {
+    const ok = typeof m.progress_index === 'number' && Number.isFinite(m.progress_index);
+    const iv = String(m.evaluation_version || D.evaluation_version || '').replace(/^v/, '').replace(/\.0$/, '');
+    const pv = String(m.progress_version || '').replace(/^v/, '');
+    return `智能指数${iv ? 'v'+iv : ''} / 历史参照${pv ? 'v'+pv : ''}：${m.index} / ${ok ? fmt(m.progress_index,0) : '—'}`;
+  };
+  const progressVersion = String(MODELS.find(m => m.progress_version)?.progress_version || '').replace(/^v/, '');
+  document.getElementById('score-heading').textContent = `智能指数${evaluationVersion ? 'v'+evaluationVersion : ''} / 历史参照${progressVersion ? 'v'+progressVersion : ''}`;
+
+  // 全页共用的 HTML 转义：模型名/厂商名来自对 AA 页面的抓取，or_id 来自 OpenRouter
+  // 目录，data_note 里还拼着源站异常原文 —— 凡走 innerHTML 的插值都必须过这里。
+  // （原先只有"变动总结"一处转义，表格、横幅、tooltip、能力线全裸奔。）
+  const escT = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+  /* ---- 顶部条 ---- */
+  document.getElementById('gen').textContent = D.generated_at || '—';
+  const srcs = D.sources || {};
+  // 用 querySelectorAll 而不是 getElementById：页面上有两个 .srcs 容器（顶栏与
+  // "数据源状态"卡片）曾共用同一个 id，getElementById 只返回第一个，卡片于是永远空白
+  // —— 看着像"没配数据源"，实际是渲染代码根本没跑到那块。
+  const pillHTML = Object.entries(srcs).map(([k,s])=>{
+    const label = {aa:'AA 官方榜', aa_progress:'AA Progress', openrouter:'OpenRouter 报价', datalearner:'DataLearner 镜像'}[k] || k;
+    // stale 是「抓取失败但用了旧快照」：数据能看，得标成黄色，
+    // 不能跟全绿的实时数据长得一样，否则会被当成实时值。
+    const cls = s.stale ? 'warn' : (s.ok ? '' : 'bad');
+    const txt = s.stale ? `快照 ${(s.from||'').slice(11)}` : (s.ok ? s.n+' 条' : '失败');
+    return `<div class="src ${cls}"><i></i>${label} <span>${txt} · ${(s.ts||'').slice(11)}</span></div>`;
+  }).join('') || (HAS_PAYLOAD ? ''
+      // 一个源胶囊都没有时不能留空：留空看着像"没配源"，而真实原因是数据文件没读到
+      : `<div class="src bad"><i></i>未读到 data/latest.js <span>文件缺失 / 软链断 / 不可读</span></div>`);
+  document.querySelectorAll('.srcs').forEach(el => { el.innerHTML = pillHTML; });
+
+  /* ---- 降级横幅 ---- */
+  // data_state / data_note 由爬虫算好带出来，这里只管显示，不重新判断
+  const STATE = D.data_state || 'ok', NOTE = D.data_note || '';
+  // 横幅是纯增强：元素被误删时也必须让看板主体照常渲染。
+  // 这里要是抛错，整个 IIFE 挂掉、整页空白——正是「一崩全崩」的老毛病。
+  if (STATE !== 'ok' && NOTE){
+    const box = document.getElementById('banner');
+    if (box){
+      box.style.display = 'flex';
+      box.innerHTML = `<span>${escT(NOTE)}</span><span class="x" title="关闭">×</span>`;
+      box.querySelector('.x').onclick = () => { box.style.display = 'none'; };
+    }
+  }
+
+  /* ---- 配色探测结果 ----
+     extract_logo_palette.py 直接解析 logo 的 SVG 源码拿到精确品牌色。
+     这里只消费不再算：亮度阈值之类判据全留在 Python 端，前端各写一套必然对不上。 */
+  const PAL = D.logo_palette || {};
+  const palOf = m => PAL[(m.logo_local||'').split('/').pop().replace(/\.(svg|png)$/i,'')] || null;
+  // ring_bg 是爬虫算完、已经过可读性约束的圆底色；描边用厂商标识色。
+  // 描边为什么改用 brand_color 而不是 palette 的 theme：logo 自己是黑白的厂商
+  // （SpaceXAI、StepFun、Z AI）theme 就是灰，11 家里 5 家同色，前 20 名的 Meta / SpaceXAI
+  // 在图上跟"其他"分不开。爬虫的 vendor_colors 已按 ΔE 把每家拉开，这里直接消费。
+  // 圆底仍然用 ring_bg：它过了对比度判据，换成品牌色会把白 icon 糊掉。
+  const ringBg   = m => { const p = palOf(m); return p ? p.ring_bg : (m.brand_color || '#64748B'); };
+  const ringEdge = m => m.brand_color || (palOf(m) ? palOf(m).theme : '#64748B');
+  // 图标反色：探测说需要时把 icon 拍纯白，贴在彩色圆底上才看得清。
+  // 滤镜只能加在 img 上，加在容器上会把背景一起反掉。
+  const ringInk  = m => { const p = palOf(m); return (p && p.invert_icon) ? 'filter:brightness(0) invert(1)' : ''; };
+  const ringFg   = m => { const p = palOf(m); return p ? p.fg_on_bg : '#ffffff'; };
+
+  // tps 只收**实测**值：占位气泡的尺寸要跟"真的测出来的最慢点"比，推估值和参照带都不是实测。
+  // 规模上限 tmax 反过来要把推估值与参照带上界都算进去，否则一个插值出来的高值会把真实气泡全压扁
+  //（与 render_scatter_svg.py 的 tmax 同一口径）。
+  const tps = MODELS.map(m=>m.tok_s || 0).filter(v=>v>0);
+  const tmax = Math.max(...tps,
+    ...MODELS.map(m=>m.tok_s_est || 0).filter(v=>v>0),
+    ...MODELS.map(m=>(m.tok_s_band || [])[1] || 0).filter(v=>v>0), 1);
+  // 第四档（同级参照带）的行：前三档全落空才有它，只有范围、没有中心值。
+  // 判据与 render_scatter_svg.py 逐字对齐：est 与 band 互斥，两者都要求"没有实测 tok_s"。
+  const isEst  = p => !p.tok_s && !!p.tok_s_est;
+  const isBand = p => !p.tok_s && !p.tok_s_est && !!p.tok_s_band;
+  // 气泡/图例圆：**面积**正比于 tok/s，所以半径 = R_MAX·√(x/tmax)。
+  // 下限 R_MIN 只为兜住"看不见/点不到"的极端小值，不参与常规编码。
+  // 以前是 8+26√x / 4+10√x 这种加性形式 —— 那个常数会把面积编码带偏
+  // （x=0.25 时面积占比 40%，真比例应是 25%）。
+  // 与 render_scatter_svg.py 的 radius() 同构，R_MAX 因画布不同而不同。
+  const R_MIN = 2, LEG_R_MAX = 34, SCAT_R_MAX = 14;
+  const r2px = v => Math.max(R_MIN, LEG_R_MAX*Math.sqrt(Math.max(v,0)/tmax));
+  // 无 tok/s 数据的点：不能落到 R_MIN（那比最慢的真实点小一半多，看着像另一种标记），
+  // 改成"整数、且严格小于最小的真实气泡"。跟 render_scatter_svg.py 的 node_radius 同构，
+  // 各自用自己画布的 R_MAX。
+  const nodeR = rmax => {
+    const shown = tps.map(v => Math.max(R_MIN, rmax*Math.sqrt(v/tmax)));
+    return shown.length ? Math.max(1, Math.ceil(Math.min(...shown)) - 1) : 1;
+  };
+  const SCAT_R_NODE = nodeR(SCAT_R_MAX);
+
+  // 任务耗时只收正有限数；0、负数、字符串、布尔与 NaN/Infinity 都当缺失。
+  // 官方 0 是有效读数，仍要显示成 0s，只是没法做对数面积编码，所以分两个读取口：
+  //   taskOfficialOf —— 展示用，允许 0；
+  //   taskTimeOf     —— 定大小用，必须 > 0，官方缺失时退到估计点。
+  const taskOfficialOf = m => {
+    const v = metricNum(m.time_per_task_s);
+    return v !== null && v >= 0 ? v : null;
+  };
+  const taskEstOf = m => {
+    if (metricNum(m.time_per_task_s) !== null) return null;
+    const v = metricNum(m.time_per_task_est_s);
+    return v !== null && v > 0 ? v : null;
+  };
+  // 区间的两端都必须是有限正数且升序；不合规就整条作废，不画半条环带。
+  const taskPairOf = v => {
+    if (!Array.isArray(v) || v.length !== 2) return null;
+    const lo = metricNum(v[0]), hi = metricNum(v[1]);
+    return (lo !== null && hi !== null && lo > 0 && hi >= lo) ? [lo, hi] : null;
+  };
+  // 估计点先带自己的反比换算区间，只有速度参照带时退到那条区间。
+  const taskBandOf = m => {
+    if (metricNum(m.time_per_task_s) !== null) return null;
+    return taskPairOf(m.time_per_task_est_range) || taskPairOf(m.time_per_task_band);
+  };
+  const taskKindOf = m => taskOfficialOf(m) !== null ? 'official'
+    : (taskEstOf(m) !== null ? 'est' : (taskBandOf(m) ? 'band' : 'none'));
+  const taskTimeOf = m => {
+    const off = taskOfficialOf(m);
+    if (off !== null) return off > 0 ? off : null;
+    return taskEstOf(m);
+  };
+  // 区间写法：两端收位后相同就只写一个数，不写成 "1.2min–1.2min" 那种自问自答。
+  const timeSpanCell = (lo, hi) => {
+    const a = timeCell(lo), b = timeCell(hi);
+    return a === b ? a : a + '–' + b;
+  };
+  // 任务耗时的显示文本：官方 → 估计点（≈）→ 只有区间 → 破折号。
+  // 只有区间时**不给中心值**，那是把"别家多快"说成本档的速度。
+  const taskTextOf = m => {
+    const off = taskOfficialOf(m);
+    if (off !== null) return timeCell(off);
+    const est = taskEstOf(m);
+    if (est !== null) return '≈' + timeCell(est);
+    const band = taskBandOf(m);
+    return band ? timeSpanCell(band[0], band[1]) : '—';
+  };
+  // 口径说明与 render_scatter_svg.task_note 同一份措辞（两处必须一起改）。
+  // 刻意避开"（估计"和"（同级能力参照"，否则会与速度列的 估/带 计数判据互相误伤。
+  const TASK_EST_LABEL = {
+    'measured-speed': '实测速度换算',
+    'series-interp': '同族相邻档插值',
+    'series-anchor': '同族单侧锚点',
+    'family-anchor': '跨代次同词根中位'
+  };
+  const taskNoteOf = m => {
+    if (taskOfficialOf(m) !== null) return '';
+    const band = taskBandOf(m);
+    const span = band ? timeSpanCell(band[0], band[1]) : '';
+    if (taskEstOf(m) !== null)
+      return (TASK_EST_LABEL[m.time_per_task_est_basis] || '估计') + (span ? '，' + span : '');
+    return band ? '同族或同级参照区间' : '';
+  };
+  // 看板自己的大小模式偏好：只认带版本号的独立键，不和状态栏的 UserDefaults、
+  // 也不和别的看板状态共用。读取/写入都可能因隐私模式或禁用存储抛异常，
+  // 捕获后退回默认 TPS —— 存储不可用只影响记忆，不影响页面渲染。
+  const SIZE_MODE_KEY = 'modelradar.dashboard.sizeMode.v1';
+  const loadSizeMode = () => {
+    try { return localStorage.getItem(SIZE_MODE_KEY) === 'task'; }
+    catch (e) { return false; }
+  };
+  const saveSizeMode = on => {
+    try { localStorage.setItem(SIZE_MODE_KEY, on ? 'task' : 'speed'); }
+    catch (e) {}
+  };
+  let sizeByTask = loadSizeMode();
+
+  /* ---- 全局低分惩罚：只消费爬虫发布的 λ，绝不在看板里重拟合 ---- */
+  // 同一份数据在状态栏与看板必须给出同一个倍率，所以这里只做一次幂运算：
+  //   factor = (index / global_max_index) ** λ
+  // 拟合（同族锚点、最小二乘、剔除明确不推理的档）全在 task_size.py 里做一次。
+  // 旧载荷没有这块 → PENALTY_READY=false，开关禁用并在说明里讲明，不假装收缩过。
+  const PENALTY_KEY = 'modelradar.dashboard.lowPenalty.v1';
+  const PENALTY = (D.task_size_penalty && typeof D.task_size_penalty === 'object')
+    ? D.task_size_penalty : null;
+  const PENALTY_LAMBDA = PENALTY ? metricNum(PENALTY.lambda) : null;
+  const PENALTY_GMAX = PENALTY ? metricNum(PENALTY.global_max_index) : null;
+  const PENALTY_READY = PENALTY_LAMBDA !== null && PENALTY_LAMBDA > 0
+    && PENALTY_GMAX !== null && PENALTY_GMAX > 0;
+  const loadLowPenalty = () => {
+    try { return localStorage.getItem(PENALTY_KEY) === 'on'; }
+    catch (e) { return false; }
+  };
+  const saveLowPenalty = on => {
+    try { localStorage.setItem(PENALTY_KEY, on ? 'on' : 'off'); }
+    catch (e) {}
+  };
+  let lowPenaltyOn = loadLowPenalty();
+  // 与 task_size.size_factor 同义：缺块 / λ 非正 / 分数无效一律 1，且结果 ≤ 1。
+  const sizeFactorOf = m => {
+    if (!PENALTY_READY) return 1;
+    const v = metricNum(m && m.index);
+    if (v === null || v <= 0) return 1;
+    return Math.min(1, Math.pow(v / PENALTY_GMAX, PENALTY_LAMBDA));
+  };
+
+  /* ---- 图例：按智能梯队 → 离 Pareto 前沿距离排（两个键都由爬虫算好） ---- */
+  const legendBox = document.getElementById('legend');
+  const legendTitle = document.getElementById('legend-title');
+  // cap_band 是"第几梯队"（0 = 最高一档），所以正序；同梯队内 dist_front 越小越靠前；
+  // 不可画的点（缺成本/缺分）垫底按名字。
+  const lgCmp = (a,b) => ((a.cap_band ?? 1e9) - (b.cap_band ?? 1e9))
+                      || ((a.dist_front ?? 9e9) - (b.dist_front ?? 9e9))
+                      || String(a.name).localeCompare(String(b.name));
+
+  /* ---- 散点：x=每任务成本(对数) y=指数 大小=tok/s ---- */
+  const pts = MODELS.filter(m=>m.index!==null && m.apt_usd>0);
+
+  // 按任务耗时编码大小时，定义域只取**当前画得出来的点**里任务耗时有效的那些。
+  // 一个有效值（或全部相等）时 u 固定 .5；没有任何有效值时，所有点都走缺失分支。
+  const taskDomainOf = () => {
+    const vals = pts.map(taskTimeOf).filter(v => v !== null);
+    return vals.length ? { min: Math.min(...vals), max: Math.max(...vals) } : null;
+  };
+  const taskUOf = (t, dom) => {
+    if (!dom || !(t > 0)) return null;
+    if (!(dom.max > dom.min)) return 0.5;
+    const u = (Math.log10(dom.max) - Math.log10(t))
+            / (Math.log10(dom.max) - Math.log10(dom.min));
+    return Math.min(1, Math.max(0, u));
+  };
+  // 面积直接线性跟上 log10 反比归一的 u（与 x 轴同一种对数压缩），不再乘 u²。
+  const taskAreaOf = u => 0.04 + 0.96 * u;
+  // factor 缺省 1 时与改动前逐字节同构；收缩乘在**面积**上，所以半径取 √factor。
+  // 下限 0.2·SCAT_R_MAX 与 render_scatter_svg 的 TASK_R_MIN 同义：
+  // 收缩到极小仍要看得见，且与缺耗时的最小空心圆（R_MIN）分得开。
+  const taskScatR = (t, dom, factor = 1) => {
+    const u = taskUOf(t, dom);
+    if (u === null) return R_MIN;
+    const f = Math.min(1, Math.max(0, metricNum(factor) === null ? 1 : factor));
+    return Math.max(0.2 * SCAT_R_MAX,
+                    Math.min(SCAT_R_MAX, SCAT_R_MAX * Math.sqrt(taskAreaOf(u) * f)));
+  };
+  const taskLegendD = (t, dom, factor = 1) => {
+    const u = taskUOf(t, dom);
+    if (u === null) return Math.round(R_MIN * 2);
+    const f = Math.min(1, Math.max(0, metricNum(factor) === null ? 1 : factor));
+    return Math.round(2 * Math.max(0.2 * LEG_R_MAX,
+                                   Math.min(LEG_R_MAX, LEG_R_MAX * Math.sqrt(taskAreaOf(u) * f))));
+  };
+  // 当前这一档要给半径乘的倍率：只在"任务模式 + 用户打开低分惩罚 + 载荷有可用 λ"时生效。
+  const penaltyFactorFor = m => (sizeByTask && lowPenaltyOn && PENALTY_READY)
+    ? sizeFactorOf(m) : 1;
+
+  function renderLegend(){
+    if (!MODELS.length){
+      legendBox.innerHTML = `<div class="void" style="min-height:90px"><div>没有模型数据。</div></div>`;
+      return;
+    }
+    const dom = taskDomainOf();
+    legendBox.innerHTML = MODELS.filter(m=>m.tok_s>0).slice().sort(lgCmp).map(m=>{
+      const task = taskTimeOf(m);
+      const kind = taskKindOf(m);
+      // 只有区间时没有中心值可用作面积，仍是"缺任务耗时"的空心占位，
+      // 但图例文字要把那条区间写出来，否则这条信息在图上完全不可见。
+      const miss = sizeByTask && task === null;
+      // 面积编码：默认沿用 tok/s 的 r2px；任务模式用与散点同一套 u/areaFraction，
+      // 只把画布半径换成图例的 LEG_R_MAX，保证图例与图上的大小关系一致。
+      // 低分惩罚开启时乘同一个全局倍率，图例里的圆也必须跟着缩，否则两边比例对不上。
+      const d = sizeByTask ? taskLegendD(task, dom, penaltyFactorFor(m))
+                           : Math.round(r2px(m.tok_s)*2);
+      const fs = Math.max(9, d*0.16);
+      // initial 会拼进 onerror 的 JS 字符串里：只能放字母数字/汉字，别的字符（引号、
+      // 反斜杠）会破坏那段 JS。creator 名来自抓取页面，不能信。
+      const initial = ((m.creator||'?').trim()[0] || '?').replace(/[^\w\u4e00-\u9fff]/g, '?');
+      const ink = ringInk(m), fg = ringFg(m), edge = ringEdge(m);
+      const ringStyle = `width:${d}px;height:${d}px;background:${miss ? 'transparent' : ringBg(m)};border-color:${edge}${miss ? ';border-style:dashed' : ''}`;
+      const cap = !sizeByTask ? `<b>${fmt(m.tok_s,0)}</b>t/s`
+        : kind === 'band' ? `<b>${taskTextOf(m)}</b>区间`
+        : miss ? '<b>—</b>无任务耗时'
+        : `<b>${taskTextOf(m)}</b>任务`;
+      return `<div class="lg" data-k="${escT(m.name)}"${sizeByTask ? ' data-size-mode="task"' : ''}>
+        <div class="ring${miss ? ' miss' : ''}" style="${ringStyle}"${miss ? ' title="任务耗时缺失" data-task-missing="1"' : ''}>
+          ${miss ? '' : m.logo_local
+            ? `<img src="data/${m.logo_local}" alt="" style="${ink}" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'fallback',textContent:'${initial}',style:'color:${fg}'}))">`
+            : `<span class="fallback" style="color:${fg};font-size:${fs}px">${initial}</span>`}
+        </div>
+        <div class="cap">${cap}</div>
+      </div>`;
+    }).join('');
+    if (legendTitle) {
+      legendTitle.textContent = '图例 · 按智能梯队排列，同梯队内按离 Pareto 前沿的距离 · '
+        + (sizeByTask ? '圆越大任务越快' : '圆越大越快');
+    }
+    if (legendBox.dataset) legendBox.dataset.sizeMode = sizeByTask ? 'task' : 'speed';
+  }
+  const W=900, H=430, PL=46, PR=90, PT=16, PB=38;
+  const xs = pts.map(p=>Math.log10(p.apt_usd));
+  const yv = pts.map(p=>p.index);
+  // 空数据 / 单条数据时别把 min/max 算成 Infinity，否则整张 SVG 会变成 NaN 直接空白
+  const x0=xs.length?Math.min(...xs):0, x1=xs.length?Math.max(...xs):1;
+  const y0=Math.max(0,(yv.length?Math.min(...yv):0)-2), y1=(yv.length?Math.max(...yv):0)+2;
+  const px = v => PL + (Math.log10(v)-x0)/(x1-x0 || 1) * (W-PL-PR);
+  const py = v => H-PB - (v-y0)/(y1-y0 || 1) * (H-PT-PB);
+
+  // Pareto 前沿：**直接取爬虫的结论**（每个模型带 on_frontier）。这条判据原先 Python 和
+  // 这里各写一遍，改一处就得祈祷另一处别忘了跟 —— 现在只有一处实现。
+  // 「推估点与参照带不参与」也在爬虫侧保证：支配关系是这张图的硬结论，不能让一个插值出来的
+  // 值（或一条别家的范围）改写它（页面 note 里就是这么承诺的）。
+  const frontier = pts.filter(p => p.on_frontier).sort((a,b)=>a.apt_usd-b.apt_usd);
+  const path = frontier.map(p=>px(p.apt_usd)+','+py(p.index)).join(' ');
+
+  // 按推理投入连线，保留加大推理后分数反而下降的真实折返。
+  const tierRank = tier => ({'non-reasoning':0, none:0, minimal:1, min:1,
+    low:2, medium:3, high:4, xhigh:5, max:6})[
+      String(tier || '').toLowerCase().split(' with fallback')[0].trim()] ?? 99;
+  const normish = s => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+  const gk = p => p.series_key || normish(p.name);   // 没有 series_key 的旧快照退化成"每型号一族"
+  const bySeries = {};
+  pts.forEach(p => { (bySeries[gk(p)] = bySeries[gk(p)] || []).push(p); });
+  const notePoints = new Set(Object.values(bySeries).map(g => g.filter(p => p.on_frontier)
+    .sort((a,b) => tierRank(b.tier) - tierRank(a.tier) || b.index - a.index || a.apt_usd - b.apt_usd)[0]));
+  const lines = Object.entries(bySeries).filter(([, g]) => g.length > 1).map(([k, g]) => {
+    g.sort((a, b) => tierRank(a.tier) - tierRank(b.tier)
+      || a.index - b.index || a.apt_usd - b.apt_usd);
+    const sp = g.map(p => px(p.apt_usd)+','+py(p.index)).join(' ');
+    const tip = `${g[0].series||g[0].name} · ${g.length} 个档`;
+    return `<polyline class="ln" data-k="${escT(k)}" points="${sp}" fill="none" stroke="${ringEdge(g[0])}" stroke-width="1.1" stroke-opacity=".5" stroke-linejoin="round"><title>${escT(tip)}</title></polyline>`;
+  }).join('');
+
+  const scatterwrap = document.getElementById('scatterwrap');
+
+  // 把模式与公式参数同时挂到文档根、散点容器和图例上：视觉验证器不用猜常量，
+  // 也能在重渲染后立刻读到当前模式与任务耗时的实际定义域。
+  function publishSizeMode(dom){
+    const mode = sizeByTask ? 'task' : 'speed';
+    const pen = sizeByTask && lowPenaltyOn && PENALTY_READY;
+    [document.documentElement, scatterwrap, legendBox].forEach(el => {
+      if (!el || !el.dataset) return;
+      el.dataset.sizeMode = mode;
+      el.dataset.taskMode = sizeByTask ? '1' : '0';
+      el.dataset.taskMin = dom ? String(dom.min) : '';
+      el.dataset.taskMax = dom ? String(dom.max) : '';
+      el.dataset.scatRMax = String(SCAT_R_MAX);
+      el.dataset.scatRMin = String(R_MIN);
+      el.dataset.taskAreaMin = '0.04';
+      el.dataset.taskAreaMax = '1';
+      // 收缩强度与是否生效各自发布：判据既能验"用了哪个 λ"，也能区分
+      // "开关开着但载荷没有参数"（此时不收缩，页面已明说）。
+      el.dataset.sizePenalty = pen ? '1' : '0';
+      el.dataset.sizePenaltyReady = PENALTY_READY ? '1' : '0';
+      el.dataset.sizePenaltyLambda = PENALTY_READY ? String(PENALTY_LAMBDA) : '';
+      el.dataset.sizePenaltyMaxIndex = PENALTY_READY ? String(PENALTY_GMAX) : '';
+    });
+  }
+
+  function renderScatter(){
+    const dom = taskDomainOf();
+    const notes = [];
+    const marks = pts.map(p=>{
+      // 默认模式与旧版逐字同构：tok_s 缺失时用同族推估值定半径（tok_s 本身不动），
+      // 并把"这是估的"画出来 —— 虚线描边 + 同心环带（环带宽 = 参照实测散布）。
+      // 任务模式只按任务耗时定大小，TPS 推估与同心环带会误导尺寸含义，所以整体隐藏。
+      const task = taskTimeOf(p);
+      const missTask = sizeByTask && task === null;
+      const tipEst = !p.tok_s && p.tok_s_est ? p.tok_s_est : null;
+      const tipBand = isBand(p) ? p.tok_s_band : null;
+      const est = !sizeByTask && tipEst ? tipEst : null;
+      const band = !sizeByTask && tipBand ? tipBand : null;
+      let r;
+      if (sizeByTask) {
+        r = task === null ? R_MIN : taskScatR(task, dom, penaltyFactorFor(p));
+      } else {
+        const shown = p.tok_s || est;
+        r = shown ? Math.max(R_MIN, SCAT_R_MAX*Math.sqrt(shown/tmax)) : SCAT_R_NODE;
+      }
+      if (notePoints.has(p)) {
+        notes.push(`<text data-frontier-note="" x="${px(p.apt_usd)}" y="${py(p.index)+r+12}" text-anchor="middle" font-size="10" fill="currentColor" pointer-events="none">${escT(p.name)}</text>`);
+      }
+      // 边长必须等于气泡**直径**（2r）才叫填满容器：原先给的是 r，图标只占直径的 50%，
+      // 看着就是"圆很大、logo 缩中间一小坨"。方形四角用共用的圆形 clipPath 裁掉。
+      // ringInk 返回的是 CSS 声明串，必须包进 style=""：原先直接展开成
+      // `<image ... filter:brightness(0) invert(1)/>` 属非法属性，反色对散点图标整个失效
+      //（图例那边用的是 style="${ink}"，所以只有图例正常）。
+      const img = p.logo_local && !missTask
+        ? `<image href="data/${p.logo_local}" x="${px(p.apt_usd)-r}" y="${py(p.index)-r}" width="${r*2}" height="${r*2}" preserveAspectRatio="xMidYMid meet" clip-path="url(#bubclip)" pointer-events="none" style="${ringInk(p)}"/>`
+        : '';
+      const rng = !sizeByTask && ((est && p.tok_s_est_range) ? p.tok_s_est_range : band);
+      const ring = rng ? (() => {
+        const rh = Math.max(R_MIN, SCAT_R_MAX*Math.sqrt(rng[1]/tmax));
+        const rl = Math.max(R_MIN, SCAT_R_MAX*Math.sqrt(rng[0]/tmax));
+        return `<circle cx="${px(p.apt_usd)}" cy="${py(p.index)}" r="${rh}" fill="none" stroke="${ringEdge(p)}" stroke-opacity=".38" stroke-width="1"/>`
+             + (rl!==rh ? `<circle cx="${px(p.apt_usd)}" cy="${py(p.index)}" r="${rl}" fill="none" stroke="${ringEdge(p)}" stroke-opacity=".24" stroke-width="1"/>` : '');
+      })() : '';
+      // title 放在**气泡自己的 <circle> 里面**（与 render_scatter_svg.py 同构）：
+      // 放在圆外的话，区间环 + 圆外 title 的组合会让"按 <circle><title> 取半径"的
+      // 判据跨过环去配对 —— 半径就张冠李戴了，而判据照样显示绿灯。
+      const tipThink = thinkOf(p), tipRatio = thinkRatioOf(p);
+      const tip = `${p.name} · ${progressText(p)} · $${p.apt_usd}`
+        + ` · 任务耗时 ${taskTextOf(p)}` + (taskNoteOf(p) ? `（${taskNoteOf(p)}）` : '')
+        + (tipThink === null ? '' : ` · 思考时间 ${timeCell(tipThink)}`)
+        + (tipRatio === null ? '' : ` · 思考前摇 ${thinkRatioCell(p)}`)
+        + ` · ${p.tok_s ? fmt(p.tok_s,0)+' t/s'
+        : (tipEst ? '≈'+fmt(tipEst,0)+' t/s（'+p.tok_s_est_note+'）'
+        : (tipBand ? tipBand[0]+'–'+tipBand[1]+' t/s（'+(p.tok_s_band_note||'同级能力参照带')+'）'
+                  : '无 tok/s 数据（占位尺寸）'))}`
+        + (missTask ? ' · 无任务耗时（最小空心圆，速度不参与大小）' : '')
+        + (p.carried_asof ? `（沿用 ${String(p.carried_asof).slice(5,10)} 的实测值：已从榜单撤下，`
+                           + `评测版本未变）` : '');
+      const fill = missTask ? 'none' : ringBg(p);
+      const fillOp = missTask ? '' : ` fill-opacity="${band?'.28':(est?'.4':'.55')}"`;
+      const dash = (!sizeByTask && (est || band)) ? ' stroke-dasharray="3 2.5"' : '';
+      // data-task-est / data-task-band 与速度的 data-est / data-band 分开命名字段：
+      // 同一张图上两种编码各说各的数，判据不能互相误认。
+      const taskEst = taskEstOf(p), taskBand = taskKindOf(p) === 'band' ? taskBandOf(p) : null;
+      const taskAttrs = sizeByTask
+        ? ` data-task="${escT(task === null ? '' : String(task))}"`
+          + (taskEst === null ? '' : ` data-task-est="${taskEst}"`)
+          + (taskBand ? ` data-task-band="${taskBand[0]} ${taskBand[1]}"` : '')
+          + (missTask ? ' data-task-missing="1"' : '')
+          // 生效中的面积倍率：判据据此验"跨族同一 λ"，不必反解像素半径。
+          + (penaltyFactorFor(p) !== 1 ? ` data-size-penalty="${penaltyFactorFor(p).toFixed(4)}"` : '')
+        : '';
+      return `<g class="mk${est?' est':''}${band?' band':''}${p.carried_asof?' carr':''}${missTask?' taskmiss':''}" data-k="${escT(gk(p))}"${est?' data-est="1"':''}${band?' data-band="1"':''}${p.carried_asof?' data-carry="'+escT(String(p.carried_asof).slice(0,10))+'"':''}${taskAttrs}>${ring}<circle cx="${px(p.apt_usd)}" cy="${py(p.index)}" r="${r}" fill="${fill}"${fillOp} stroke="${ringEdge(p)}" stroke-opacity=".95"${dash}><title>${escT(tip)}</title></circle>
+        ${img}
+        </g>`;
+    }).join('');
+
+    const xt=[1,2,5,10].filter(v=>v>=Math.pow(10,x0)-1e-9 && v<=Math.pow(10,x1)+1e-9);
+    const xlabs=(xt.length?xt:[Math.pow(10,x0),Math.pow(10,(x0+x1)/2),Math.pow(10,x1)])
+      .map(v=>`<text x="${px(v)}" y="${H-14}" fill="#5d6a7d" font-size="10" text-anchor="middle">$${v<0.01?v.toFixed(4):v.toFixed(2)}</text>`).join('');
+    const ylabs=[y0,(y0+y1)/2,y1].map(v=>`<text x="${PL-8}" y="${py(v)+3}" fill="#5d6a7d" font-size="10" text-anchor="end">${Math.round(v)}</text>`).join('');
+
+    if (!pts.length){
+      // 空状态要说清是**哪一种**空，两者处置完全不同：
+      //   · 没读到 latest.js → 文件/软链/权限问题。页面对"抓取成没成功"零证据，
+      //     所以不能下那个结论 —— 原先这里硬写着"AA 官方榜本次抓取失败，本地又没有
+      //     可用的历史快照"，把一次加载失败说成了抓取失败，直接把人往错方向带。
+      //   · 读到了但 models 为空 → 才是真的没数据，此时拿 payload 自带的
+      //     data_note / 源状态说话，有什么证据说什么话。
+      const why = HAS_PAYLOAD
+        ? `<div style="color:#f0523f">载荷读到了，但里面没有可绘制的模型。具体哪个源挂了见上方「数据源状态」。</div>`
+        : `<div style="color:#f0523f">没读到 <code>data/latest.js</code> —— 文件缺失、<code>data</code> 软链断了、或不可读。<br>
+           这种情况下页面对抓取结果一无所知，所以不猜原因。<br>
+           补一次：点菜单栏「↻ 立即抓取」，或跑 <code>~/Library/Application Support/ModelRadar/bin/crawl.sh</code>。</div>`;
+      scatterwrap.innerHTML = `<div class="void">
+        <b>没有可绘制的数据</b>
+        <div>散点图需要「智能指数」和「每任务成本」同时存在的模型，当前一条都没有。</div>
+        ${why}
+        ${NOTE?`<div style="font-size:11.5px">${escT(NOTE)}</div>`:''}
+      </div>`;
+    } else {
+      scatterwrap.innerHTML =
+        `<svg viewBox="0 0 ${W} ${H}" width="100%" height="430" role="img"
+              aria-label="${sizeByTask
+                ? '模型每任务成本与智能指数散点图，气泡面积表示任务耗时，任务越快面积越大'
+                : '模型每任务成本与智能指数散点图，气泡面积表示输出速度'}"
+              data-size-mode="${sizeByTask ? 'task' : 'speed'}"
+              data-plot="${PL} ${PT} ${W-PR} ${H-PB}"
+              data-task-min="${dom ? dom.min : ''}" data-task-max="${dom ? dom.max : ''}"
+              data-scat-r-max="${SCAT_R_MAX}" data-scat-r-min="${R_MIN}"
+              data-task-area-min="0.04" data-task-area-max="1">
+          ${ylabs}${xlabs}
+          <line x1="${PL}" y1="${H-PB}" x2="${W-PR}" y2="${H-PB}" stroke="#232c3b"/>
+          <line x1="${PL}" y1="${PT}" x2="${PL}" y2="${H-PB}" stroke="#232c3b"/>
+          ${lines}
+          ${path?`<polyline points="${path}" fill="none" stroke="#e3b341" stroke-width="1.4" stroke-dasharray="5 4" stroke-opacity=".8"/>`:''}
+          ${marks}
+          ${notes.join('')}
+          <text x="${W-PR+6}" y="${PT+12}" fill="#5d6a7d" font-size="10">越往右上</text>
+          <text x="${W-PR+6}" y="${PT+25}" fill="#5d6a7d" font-size="10">越划算</text>
+          <text x="${PL}" y="${PT-3}" fill="#5d6a7d" font-size="10">分 ↑</text>
+        </svg>`;
+      // 悬停是委托在 svg 上的；重渲染换了节点，必须在新 svg 上重新挂一次。
+      initHover();
+    }
+    publishSizeMode(dom);
+  }
+
+  const sizeToggle = document.getElementById('sizebytask');
+  const sizeCaption = document.getElementById('size-caption');
+  const penaltyWrap = document.getElementById('penaltywrap');
+  const penaltyToggle = document.getElementById('penalizelow');
+  function updateSizeCaption(){
+    if (sizeCaption) {
+      const pen = sizeByTask && lowPenaltyOn && PENALTY_READY;
+      let cap = sizeByTask
+        ? (pen
+            ? '气泡面积 = 任务耗时映射面积 × 低分惩罚（全图统一 λ，同分同倍率）'
+            : '气泡面积 = 任务耗时（对数映射，任务越快面积越大；缺任务耗时的点为最小空心圆）')
+        : '气泡面积 = 输出 tok/s（面积正比于速度，故半径取 √）';
+      // 开关存在但载荷没参数时必须明说，否则用户点了没变化却以为已经收缩。
+      if (sizeByTask && lowPenaltyOn && !PENALTY_READY)
+        cap += '（本次载荷无收缩参数，按原比例显示）';
+      sizeCaption.textContent = cap;
+    }
+    if (legendTitle) {
+      legendTitle.textContent = '图例 · 按智能梯队排列，同梯队内按离 Pareto 前沿的距离 · '
+        + (sizeByTask ? (lowPenaltyOn && PENALTY_READY ? '圆面积兼顾任务耗时与分数' : '圆越大任务越快') : '圆越大越快');
+    }
+  }
+  function syncPenaltyUI(){
+    // 开关只在任务耗时模式出现：速度模式下"分数低就缩面积"没有可乘的面积。
+    if (penaltyWrap) {
+      if (sizeByTask) penaltyWrap.removeAttribute('hidden');
+      else penaltyWrap.setAttribute('hidden', '');
+    }
+    if (penaltyToggle) {
+      penaltyToggle.checked = !!lowPenaltyOn;
+      penaltyToggle.disabled = !PENALTY_READY;
+      if (typeof penaltyToggle.setAttribute === 'function')
+        penaltyToggle.setAttribute('aria-checked', lowPenaltyOn ? 'true' : 'false');
+    }
+  }
+  function applySizeMode(on){
+    sizeByTask = !!on;
+    if (sizeToggle) {
+      sizeToggle.checked = sizeByTask;
+      if (typeof sizeToggle.setAttribute === 'function')
+        sizeToggle.setAttribute('aria-checked', sizeByTask ? 'true' : 'false');
+    }
+    syncPenaltyUI();
+    updateSizeCaption();
+    renderLegend();
+    renderScatter();
+  }
+  if (sizeToggle) {
+    sizeToggle.checked = sizeByTask;
+    if (typeof sizeToggle.setAttribute === 'function')
+      sizeToggle.setAttribute('aria-checked', sizeByTask ? 'true' : 'false');
+    // 只在用户改变时写入；初始化只读取，避免重载把默认值覆盖回存储。
+    sizeToggle.onchange = e => {
+      const on = !!e.target.checked;
+      applySizeMode(on);
+      saveSizeMode(on);
+    };
+  }
+  if (penaltyToggle) {
+    // 与上面同一条纪律：初始化只读不写，只有用户真正切换才落盘。
+    penaltyToggle.onchange = e => {
+      lowPenaltyOn = !!e.target.checked;
+      syncPenaltyUI();
+      updateSizeCaption();
+      renderLegend();
+      renderScatter();
+      saveLowPenalty(lowPenaltyOn);
+    };
+  }
+  syncPenaltyUI();
+  updateSizeCaption();
+  renderLegend();
+  renderScatter();
+
+  /* ---- 变动 ---- */
+  const chg = D.changes || [];
+  // 位数取爬虫随载荷发布的那一张表（fetch_model_data.DISPLAY_DECIMALS），不在这里抄第二份：
+  // 表格里速度走 fmt(m.tok_s,0) 是整数，徽标若按默认两位会同一页面出现「123」和「123.29」两种写法。
+  // 载荷没这张表（改动前生成的旧快照）时退回两位，与改动前逐字一致。
+  const DP = D.display_decimals || {};
+  const dpOf = f => (Object.prototype.hasOwnProperty.call(DP, f) ? DP[f] : 2);
+  const renameRows = (D.rename_lines || []).map(s => `<div class="chgbadge"><span class="mn">${escT(s)}</span></div>`).join('');
+  const rows = renameRows + (chg.length ? chg.filter(c => c.type!=='renamed' || !c.quiet).map(c=>{
+        // 模型名与字段名都是远端页面上的字符串，这里直接进 innerHTML：不转义等于把注入面
+        // 开放给任何能发布模型的人。SUM 那条分支转义了不代表平铺这条路也转义了。
+        const nm = escT(c.name);
+        const nm22 = escT(c.name.slice(0,22));
+        if(c.type==='new') return `<div class="chgbadge"><span class="mn">${nm}</span><span class="fd">新进榜</span></div>`;
+        if(c.type==='gone') return `<div class="chgbadge"><span class="mn">${nm}</span><span class="fd">掉榜</span></div>`;
+        // 沿用行既不是新进榜也不是掉榜：AA 本轮没有它，读数是从台账带回来的旧值。
+        // 不单列这一支，它会落到下面按字段渲染的分支、因为 fields 为空而变成一张空徽标。
+        if(c.type==='carried') return `<div class="chgbadge"><span class="mn">${nm}</span><span class="fd">沿用旧读数</span></div>`;
+        return c.fields.map(f=>{
+          const lb = escT(f.label);
+          // 归因标签（Python 侧算好的事实：匹配对象换了 / AA 成本未变）。
+          // 标签内容里带 or_id，那是远端目录里的字符串，同样必须转义。
+          const tg = (f.tags||[]).map(t=>`<span class="tg">${escT(t)}</span>`).join('');
+          // 没有基数的变动（"没有"→"有值"，或反过来）算不出百分比，按 kind 单独显示；
+          // 落到 ▲▼ 那条分支里会显示成 "NaN%"，比静默更糟。
+          if(f.kind==='appeared') return `<div class="chgbadge"><span class="mn">${nm22}</span>
+            <span class="fd">${lb}</span><span class="up">新增 ${fmt(f.to, dpOf(f.field))}</span>${tg}</div>`;
+          if(f.kind==='disappeared') return `<div class="chgbadge"><span class="mn">${nm22}</span>
+            <span class="fd">${lb}</span><span class="down">这次缺失（原 ${fmt(f.from, dpOf(f.field))}）</span>${tg}</div>`;
+          return `<div class="chgbadge"><span class="mn">${nm22}</span>
+            <span class="fd">${lb}</span>
+            <span class="${f.delta>0?'up':'down'}">${f.delta>0?'▲':'▼'} ${fmt(f.to, dpOf(f.field))} (${f.pct>0?'+':''}${fmt(f.pct,1)}%)</span>${tg}</div>`;
+        }).join('');
+      }).join('') : '');
+  // 总结按**内容指纹**配对：数据一更新，昨天那段话就不再属于今天 —— 宁可退回表格，
+  // 也不能让旧总结顶着新数据显示成"刚刚发生的事"。
+  const SUM = (window.SUMMARY && window.SUMMARY.content_hash
+               && window.SUMMARY.content_hash === D.content_hash) ? window.SUMMARY : null;
+  // models 为空时说「没有变动」是撒谎——那是压根没数据可比。
+  // 爬虫在这种时候已经把 changes 清空了，这里照实说明。
+  document.getElementById('changes').innerHTML =
+    (!MODELS.length) ? `<span class="empty">没有当前数据可比，跳过变动比对。</span>`
+    : (SUM && SUM.text)
+      // 有总结：说人话，逐条明细降到悬停（title）里。文本是模型生成的，必须转义 ——
+      // 它的输入包含远端页面上的模型名，不转义就等于把 innerHTML 开放给远端内容。
+      ? (() => {
+          const plain = [...(D.rename_lines || []), ...chg.filter(c => c.type!=='renamed' || !c.quiet).map(c => c.type==='new' ? c.name+' 新进榜'
+                                 : c.type==='gone' ? c.name+' 掉榜'
+                                 : c.type==='carried' ? c.name+' 沿用旧读数'
+                                 : (c.fields||[]).map(f => c.name+' '+f.label+' '
+                                     + (f.kind==='appeared' ? '新增 '+f.to
+                                        : f.kind==='disappeared' ? '缺失（原 '+f.from+'）'
+                                        : f.from+'→'+f.to+(f.pct==null?'':' ('+(f.pct>0?'+':'')+f.pct+'%)'))
+                                     + ((f.tags||[]).length ? '〔'+f.tags.join('；')+'〕' : '')).join('；')
+                          )].join('\n');
+          return `<div class="sumline" title="${escT(plain)}">${escT(SUM.text)}`
+               + `<span class="sumtag">机器生成 · 悬停看逐条</span></div>`;
+        })()
+    : rows || '<span class="empty">本次抓取与上次完全一致，没有变动。</span>';
+
+  /* ---- 表格 ---- */
+  const tb = document.getElementById('tb');
+  let sortKey='index', sortAsc=false, kw='', cnOnly=false;
+  const CN = ['Xiaomi','Alibaba','DeepSeek','Z AI','Tencent','MiniMax','Kimi','MoonshotAI'];
+  function render(){
+    let rows = MODELS.filter(m=>{
+      if(cnOnly && !CN.some(v=>(m.creator||'').includes(v))) return false;
+      if(!kw) return true;
+      const s=(m.name+' '+(m.creator||'')+' '+(m.or_id||'')).toLowerCase();
+      return s.includes(kw);
+    });
+    rows.sort((a,b)=>{
+      const key = sortKey;
+      const pick = m => key === 'think_s' ? thinkOf(m)
+        : key === 'think_ratio' ? thinkRatioOf(m)
+        // 任务耗时列显示的可能不是官方原值：排序键必须与所见一致，
+        // 否则"≈"或区间的行会按一个看不见的字段插队。只有区间仍按缺失排最后。
+        : (key === 'time_per_task_s'
+           ? (taskOfficialOf(m) ?? taskTimeOf(m)) : m[key]);
+      const x = pick(a), y = pick(b);
+      if(x===y) return 0;
+      if(x===null||x===undefined) return 1;
+      if(y===null||y===undefined) return -1;
+      return (x>y?1:-1)*(sortAsc?-1:1);
+    });
+    tb.innerHTML = rows.map(m=>{
+      const logo = m.logo_local
+        ? `<img src="data/${m.logo_local}" alt="" style="${ringInk(m)}" onerror="this.style.visibility='hidden'">`
+        : '';
+      const init=((m.creator||'?').trim()[0] || '?').replace(/[^\w\u4e00-\u9fff]/g, '?');
+      return `<tr>
+        <td><div class="mcell">${logo||`<span style="opacity:.5">${init}</span>`}
+          <span class="nm">${escT(m.name)}</span><span class="cr">${escT(m.creator||'')}</span>
+          ${m.dl_index!==null&&m.dl_index!==undefined?'<span class="tag" title="DataLearner 国内镜像分数">DL '+m.dl_index+'</span>':''}
+          ${m.carried_asof?'<span class="tag" title="沿用 '+escT(m.carried_asof)+' 的实测值：已从榜单撤下，但没有任何现役行在指数/成本/速度上全面优于它">沿用 '+escT(String(m.carried_asof).slice(5,10))+'</span>':''}</div></td>
+        <td>${m.index??'—'} / ${typeof m.progress_index === 'number' ? fmt(m.progress_index,0) : '—'}</td>
+        <td>$${fmt(m.apt_usd,4)}</td>
+        <td${taskNoteOf(m) ? ` title="${escT('任务耗时 ' + taskTextOf(m) + '（' + taskNoteOf(m) + '）')}"` : ''}>${taskTextOf(m)}</td>
+        ${HAS_THINK ? `<td>${timeCell(thinkOf(m))}</td>` : ''}
+        ${HAS_RATIO ? `<td>${thinkRatioCell(m)}</td>` : ''}
+        <td>${speedCell(m)}</td>
+        <td>${timeCell(metricNum(m.ttft_s))}</td>
+        <td>${m.in_per_1m_usd===null?'—':'$'+fmt(m.in_per_1m_usd,4)}</td>
+        <td>${m.out_per_1m_usd===null?'—':'$'+fmt(m.out_per_1m_usd,4)}</td>
+        <td>${m.ctx||'—'}</td>
+        <td style="color:var(--dim)">${m.or_id?`<a href="https://openrouter.ai/${encodeURIComponent(m.or_id)}" target="_blank">${escT(m.or_id)}</a>`:'—'}</td>
+      </tr>`;
+    }).join('');
+  }
+  document.querySelectorAll('th').forEach(th=>th.onclick=()=>{
+    const k=th.dataset.k;
+    if(sortKey===k) sortAsc=!sortAsc; else {sortKey=k; sortAsc=false;}
+    document.querySelectorAll('th').forEach(x=>x.classList.remove('sort'));
+    th.classList.add('sort');
+    render();
+  });
+  document.getElementById('q').oninput = e=>{kw=e.target.value.toLowerCase(); render();};
+  document.getElementById('onlycn').onchange = e=>{cnOnly=e.target.checked; render();};
+  render();
+
+  /* ---- 悬停高亮：整族（能力线 + 该族全部档位气泡）置顶 + 放大 + 加粗 ----
+     HOVER-BEGIN/END 之间必须与 render_scatter_svg.HOVER_JS 逐字一致，
+     verify_dashboard.mjs 会把两边抠出来对比 —— 只改一边就会出现
+     「网页能高亮、菜单栏不能」这种没人报警的漂移。 */
+  function initHover(){
+/* HOVER-BEGIN */
+  // 选择器要"先找散点容器、再退回唯一 svg"：看板页面上还有一张 0 尺寸的裁剪 <svg>，
+  // 它排在散点前面，直接 querySelector('svg') 会绑到那张空图上，高亮整个失灵。
+  var svg = document.querySelector('#scatterwrap svg') || document.querySelector('svg');
+  if (!svg) return;
+  var top = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  top.setAttribute('class', 'toplayer');
+  svg.appendChild(top);
+  // 卡片单独一个组，且永远是 toplayer 的第一个孩子：SVG 按文档序绘制，
+  // 这样卡片天然在气泡与能力线下面（用户口径：原点和连线悬浮到卡片上层），
+  // 卡片内部谁压谁只取决于组内顺序，不用跟点线抢位置。
+  var cards = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+  cards.setAttribute('class', 'cards');
+  top.insertBefore(cards, top.firstChild || null);
+  var home = [], cur = null, pend = null;
+  // 选择优先级：指针指着的组 > 仍有焦点的脚注 > 都不亮。
+  // pointerFoot / hoverGroup 是指针态，focusFoot 是焦点态，分开记；清理时按优先级重算，
+  // 不能无条件熄灯 —— 脚注 A 有焦点、指针掠过脚注 B 再离开时（或离开图区、空白处延时收起时），
+  // A 的高亮必须留下。否则键盘用户只是被鼠标路过，焦点选择就被抹掉了。
+  var pointerFoot = null, hoverGroup = null, focusFoot = null;
+  var esc = function(k){ return (window.CSS && CSS.escape) ? CSS.escape(k) : k.replace(/[^a-z0-9]/gi,''); };
+  function enlarge(el){
+    // 用 getBBox 自己算缩放中心：CSS transform-box:fill-box 在部分 WebKit 上对 <g> 不生效，
+    // 那种情况下缩放会绕 SVG 原点做，气泡直接飞出图外 —— 比不高亮更糟。
+    var b;
+    try { b = el.getBBox(); } catch (e) { return; }
+    if (!b || !b.width) return;
+    var cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+    el.setAttribute('transform',
+      'translate(' + cx + ',' + cy + ') scale(1.45) translate(' + (-cx) + ',' + (-cy) + ')');
+  }
+  function fitCard(ch){
+    // 塌缩：把背景矩形收到"文字实际并集 + 内边距"。作者侧的字宽是估的（各机器字体不同），
+    // 内容少的时候卡底会空出一大块 —— 用户要的"内容不足时自动塌缩"就是这一步。
+    // 塌缩只能朝卡片伸出去的那一侧收：tl 钉住左上角、br 钉住右下角，
+    // 否则卡片会滑离自己的小球，读者认不出这张卡说的是哪个档。
+    var r = ch.querySelector ? ch.querySelector('rect') : null;
+    if (!r) return null;
+    // 基准只用 data-r0（作者侧原始框），不用 rect 当前值：塌缩会改写 rect，
+    // 拿当前值当基准就是"每次悬停再缩一次、再挪一次"
+    var r0 = String(ch.getAttribute('data-r0') || '').split(' ');
+    var ax = +r0[0], ay = +r0[1], aw = +r0[2], ah = +r0[3];
+    if (!(ax >= 0) || !(aw > 0)) { ax = +r.getAttribute('x'); ay = +r.getAttribute('y');
+                                   aw = +r.getAttribute('width'); ah = +r.getAttribute('height'); }
+    var u = null;
+    var ts = ch.querySelectorAll('text');
+    for (var i = 0; i < ts.length; i++) {
+      var b = null;
+      try { b = ts[i].getBBox(); } catch (e) { b = null; }
+      if (!b || !b.width) continue;
+      if (!u) u = { x: b.x, y: b.y, x2: b.x + b.width, y2: b.y + b.height };
+      else {
+        u.x = Math.min(u.x, b.x); u.y = Math.min(u.y, b.y);
+        u.x2 = Math.max(u.x2, b.x + b.width); u.y2 = Math.max(u.y2, b.y + b.height);
+      }
+    }
+    if (!u) return [ax, ay, aw, ah];        // 量不到（假 DOM 桩、老引擎）就照作者侧那份尺寸用
+    var w = (u.x2 - u.x) + 12, h = (u.y2 - u.y) + 8;
+    var x = u.x - 6, y = u.y - 4;
+    r.setAttribute('x', x.toFixed(1)); r.setAttribute('y', y.toFixed(1));
+    r.setAttribute('width', w.toFixed(1)); r.setAttribute('height', h.toFixed(1));
+    // 整组平移：只挪矩形会把文字留在原地（实测 7 行全部出框）。
+    // 平移量按贴法钉住对应那一角：br 钉右下角（族卡对着球的那一角）、tl 钉左上角。
+    var dx = 0, dy = 0;
+    if ((ch.getAttribute('data-anchor') || 'tl') === 'br') { dx = ax + aw - (x + w); dy = ay + ah - (y + h); }
+    else { dx = ax - x; dy = ay - y; }
+    // 这里**不写** transform：写它的只有 cardsOf（它还要在同一段上叠退让量）。
+    // 两处各写一遍，后写的会把钉角那段覆盖掉 —— 卡片整张滑离自己的小球。
+    // 末尾两个数是塌缩的钉角偏移，cardsOf 拿它们算最终平移量。
+    return [x + dx, y + dy, w, h, dx, dy];
+  }
+  // 绘图区四边从 svg 的 data-plot 读，不在 JS 里再抄一份几何常数（画布一改就分叉）
+  var plot = String(svg.getAttribute('data-plot') || '54 24 660 406').split(' ').map(Number);
+  function clampX(x, w){ return Math.min(Math.max(x, plot[0] + 2), Math.max(plot[0] + 2, plot[2] - 2 - w)); }
+  function clampY(y, h){ return Math.min(Math.max(y, plot[1] + 2), Math.max(plot[1] + 2, plot[3] - 2 - h)); }
+  /* 候选位 = 退让顺序：作者位 → 绕中心球换四角 → 上下左右错开一格。全都夹在绘图区内。
+     先保"贴着球"的作者位，再试同样贴球但换一侧，最后才平移让路。 */
+  function places(ch, box){
+    var w = box[2], h = box[3], out = [[box[0], box[1]]];
+    var b = String(ch.getAttribute('data-ball') || '').split(' ').map(Number);
+    if (b.length === 3 && isFinite(b[0]) && b[0] > 0) {
+      var bx = b[0], by = b[1], br = b[2], g = 4;
+      out.push([clampX(bx + br + g, w), clampY(by + br + g, h)]);          // 球的右下
+      out.push([clampX(bx - br - g - w, w), clampY(by + br + g, h)]);      // 球的左下
+      out.push([clampX(bx + br + g, w), clampY(by - br - g - h, h)]);      // 球的右上
+      out.push([clampX(bx - br - g - w, w), clampY(by - br - g - h, h)]);  // 球的左上（作者位同侧）
+    }
+    out.push([clampX(box[0], w), clampY(box[1] - h - 6, h)]);
+    out.push([clampX(box[0], w), clampY(box[1] + h + 6, h)]);
+    out.push([clampX(box[0] - w - 6, w), clampY(box[1], h)]);
+    out.push([clampX(box[0] + w + 6, w), clampY(box[1], h)]);
+    return out;
+  }
+  function cardsOf(list, cards){
+    // 顶栏「▤ 卡片」关掉时一张都不显（高亮照旧）。undefined = 不干预，
+    // 所以直接用浏览器打开 chart.html 或看板页面时行为不变。
+    if (window.MR_CARDS === 0) return;
+    var taken = [], sunk = [], up = [];
+    list.sort(function(x, y){
+      return (+x.getAttribute('data-pri')) - (+y.getAttribute('data-pri'));
+    }).forEach(function(ch){
+      var q = fitCard(ch);                  // 先塌缩再比位：拿真实尺寸比才不会白让位
+      if (!q) return;
+      // 候选位按退让顺序试：先试作者位，一有空位就定（这样"贴球"永远优先）；
+      // 全都压着别人才取**压得最少**的那一个 —— 避让是"沉到底下但仍露出"，不是"就不显示"。
+      var cands = places(ch, q), free = null, best = null, bestPen = Infinity;
+      for (var i = 0; i < cands.length; i++) {
+        var box = [cands[i][0], cands[i][1], q[2], q[3]], pen = 0;
+        for (var j = 0; j < taken.length; j++) {
+          var ox = Math.min(box[0] + box[2], taken[j][0] + taken[j][2]) - Math.max(box[0], taken[j][0]);
+          var oy = Math.min(box[1] + box[3], taken[j][1] + taken[j][3]) - Math.max(box[1], taken[j][1]);
+          if (ox > 0 && oy > 0) pen += ox * oy;
+        }
+        if (pen === 0) { free = box; break; }
+        if (pen < bestPen) { bestPen = pen; best = box; }
+      }
+      if (free) up.push(ch); else { free = best; sunk.push(ch); }
+      ch.classList.add('hi');
+      // transform = 塌缩的钉角偏移 + 退让的偏移，两段必须一起写：fitCard 已经把矩形改成了
+      // 局部坐标，这里只写退让量就会把塌缩那段丢掉，整张卡滑离它钉住的那一角（实测偏 162px）。
+      ch.setAttribute('transform', 'translate(' + (q[4] + free[0] - q[0]).toFixed(1) + ','
+                                    + (q[5] + free[1] - q[1]).toFixed(1) + ')');
+      taken.push(free);
+    });
+    // 组内顺序 = 叠放顺序：无论沉底还是贴上位，一律**分数高的最后画**（压在上面）。
+    // 沉底的那批若按处理序（分数高→低）画，就成了"赢家垫在最下、输家盖着它"，
+    // 与"衬到底下"正好相反 —— 所以两组都要 pri 倒序。
+    sunk.slice().reverse().concat(up.slice().reverse()).forEach(function(ch){ cards.appendChild(ch); });
+  }
+  function restack(){
+    // 点与线之间也要层序：能力线在下、气泡在上、被指到的那格图例最上。
+    // 名单先快照：appendChild 会就地改 children，边遍历活集合边搬会漏项（第一版就搬"乱"过）。
+    var kids = [].slice.call(top.children);
+    kids.forEach(function(el) { if (el.classList.contains('ln')) top.appendChild(el); });
+    kids.forEach(function(el) { if (el.classList.contains('mk')) top.appendChild(el); });
+    kids.forEach(function(el) { if (el.classList.contains('lgc')) top.appendChild(el); });
+  }
+  function remember(el){
+    // 先记原位再搬：同父节点的多个元素如果边搬边记，后一个记到的下标已经被前一个腾走，
+    // 恢复时就会错位（脚注按集合一次抬起多个点时最容易撞上）。
+    home.push([el, el.parentNode, Array.prototype.indexOf.call(el.parentNode.children, el)]);
+  }
+  function light(k, a, force){
+    if (!force && cur && cur.mode === 'group' && cur.a === a && cur.k === k) return;   // 同一组内的微移动必须完全不动 DOM
+    dark();
+    cur = {mode:'group', a:a, k:k};
+    var chips = [];
+    // 两种粒度共用一套搬运：data-k = 同族同代次（悬停一个气泡时），
+    // data-c = 整个厂商（悬停图例格时）。图例格只有 data-c，气泡两个都有 ——
+    // 所以落点在气泡上就必然走族，不会被厂商组盖掉。
+    var hits = [].slice.call(svg.querySelectorAll('[' + a + '="' + esc(k) + '"]'));
+    if (a === 'data-k') hits = hits.concat([].slice.call(svg.querySelectorAll('[data-history-for="' + esc(k) + '"]')));
+    hits.forEach(remember);
+    hits.forEach(function(el){
+      if (el.classList.contains('chip')) { chips.push(el); cards.appendChild(el); }
+      else {
+        el.classList.add('hi');
+        if (el.classList.contains('mk')) enlarge(el);
+        top.appendChild(el);          // 置顶：SVG 按文档序绘制，不搬就是被压住
+      }
+    });
+    restack();
+    cardsOf(chips, cards);
+  }
+  // 脚注的三个数字是**精确子集**（哪些点没测到速度、哪些是推估、哪些是参照带），
+  // 不能拿 data-k 整族去亮：一族里可能只有一档属于这个子集，整族抬起就多亮了。
+  // 所以这里按 data-i 逐个认点；线只有在整族都被选中时才亮；卡片按命中的族复用 cardsOf。
+  function lightIds(list, force){
+    var ids = (list || []).map(String);
+    var sig = ids.join(',');
+    if (!force && cur && cur.mode === 'ids' && cur.sig === sig) return;
+    dark();
+    cur = {mode:'ids', ids: ids, sig: sig};
+    var picked = {};
+    ids.forEach(function(i){ picked[i] = 1; });
+    var marks = [].slice.call(svg.querySelectorAll('.mk[data-i]')).filter(function(el){
+      return picked[el.getAttribute('data-i')];
+    });
+    // 能力线是族级的：只有整族都在这个子集里才亮，避免"数了 3 个点、亮了一整族"。
+    var fams = [], seen = {};
+    marks.forEach(function(el){
+      var k = el.getAttribute('data-k');
+      if (k !== null && !seen[k]) { seen[k] = 1; fams.push(k); }
+    });
+    var lines = [].slice.call(svg.querySelectorAll('.ln[data-k]')).filter(function(el){
+      var k = el.getAttribute('data-k'), mks = svg.querySelectorAll('.mk[data-k="' + esc(k) + '"]');
+      if (!mks.length) return false;
+      for (var i = 0; i < mks.length; i++) {
+        if (!picked[mks[i].getAttribute('data-i')]) return false;
+      }
+      return true;
+    });
+    var chips = [];
+    fams.forEach(function(k){
+      [].forEach.call(svg.querySelectorAll('.chip[data-k="' + esc(k) + '"]'), function(ch){
+        chips.push(ch);
+      });
+    });
+    // 所有元素先在原位上记完再搬（见 remember 的理由）。
+    marks.forEach(remember);
+    lines.forEach(remember);
+    chips.forEach(remember);
+    marks.forEach(function(el){
+      el.classList.add('hi');
+      enlarge(el);
+      top.appendChild(el);
+    });
+    lines.forEach(function(el){ el.classList.add('hi'); top.appendChild(el); });
+    // 卡片按命中的族拿 data-k：只搬这几族，不全局清空别的族；MR_CARDS=0 时 cardsOf 会
+    // 直接返回，卡片不显，但点的高亮照旧（见 cardsOf 开头）。
+    chips.forEach(function(ch){ cards.appendChild(ch); });
+    restack();
+    cardsOf(chips, cards);
+  }
+  function restoreChip(el){
+    // 卡片塌缩会改写 rect 的 x/y/w/h；只清 transform 会让它停在塌缩后的尺寸上。
+    // 按 data-r0 还原作者侧几何（SIZE_JS 切换模式时也同步更新 data-r0）。
+    if (!el.classList || !el.classList.contains('chip')) return;
+    var r = el.querySelector ? el.querySelector('rect') : null;
+    if (!r) return;
+    var r0 = String(el.getAttribute('data-r0') || '').split(' ').map(Number);
+    if (r0.length === 4 && isFinite(r0[0]) && isFinite(r0[2]) && r0[2] > 0) {
+      r.setAttribute('x', r0[0].toFixed(1));
+      r.setAttribute('y', r0[1].toFixed(1));
+      r.setAttribute('width', r0[2].toFixed(1));
+      r.setAttribute('height', r0[3].toFixed(1));
+    }
+  }
+  function dark(){
+    if (!home.length && !cur) return;
+    // 归位按"原父节点分组 + 原下标升序"，不能按 home 的记录顺序逐个插：
+    // 一次抬起同父的多个节点时，先插回去的那个会占掉下标，后一个再按旧下标插就前后颠倒
+    // （实测整族含能力线时 mk6 会跑到 mk5 前面，连末尾的 toplayer 也跟着漂）。
+    // 升序插入为什么对：下标更小的兄弟都已回位，下标更大的要么原位没动、要么还没回来，
+    // 都在当前 children[原下标] 或更后面；所以此刻 children[原下标] 就是该插的位置。
+    // 不用 nextSibling 引用：前一个节点被搬走会让后一个记的引用失效。
+    var buckets = [];
+    home.forEach(function(h){
+      var b = null;
+      for (var i = 0; i < buckets.length; i++) {
+        if (buckets[i][0] === h[1]) { b = buckets[i]; break; }
+      }
+      if (!b) { b = [h[1], []]; buckets.push(b); }
+      b[1].push(h);
+    });
+    buckets.forEach(function(b){
+      b[1].sort(function(x, y){ return x[2] - y[2]; }).forEach(function(h){
+        h[0].classList.remove('hi');
+        h[0].removeAttribute('transform');
+        restoreChip(h[0]);
+        b[0].insertBefore(h[0], b[0].children[h[2]] || null);
+      });
+    });
+    home = []; cur = null;
+  }
+  // 切换气泡尺寸模式后，若指针正停在某一组上，必须按新半径重新贴卡；
+  // 不重贴就会沿用旧锚点与旧碰撞列表（卡片离球或压住别人）。只重放当前组，不新开一套几何。
+  // 脚注子集也走同一个钩子重放，否则开关模式时卡片会停在旧几何上。
+  svg.__mrRelayout = function(){
+    if (!cur) return;
+    var c = cur;
+    if (c.mode === 'ids') lightIds(c.ids, true);
+    else light(c.k, c.a, true);
+  };
+  // 只接 pointerover / pointerleave，**不接 pointerout**：搬动节点时浏览器会为
+  // 被搬走的节点补发 pointerout，一接上就成了自己触发自己 —— 指针轻微移动就在
+  // "搬上去/搬回来"之间来回抖（2026-09-29 线上闪烁就是这个）。
+  // 同理 .toplayer 不能设 pointer-events:none：那样一置顶就不再命中，指针的 target
+  // 立刻变成顶层下面的空白图区，同样进闪烁循环。
+  // 一次清理、或一次指针/焦点变化后，都按同一优先级重算"现在该亮谁"：
+  // 指针指着的组 > 仍有焦点的脚注 > 都不亮。清理不再无条件熄灯，
+  // 否则脚注 A 有焦点、指针掠过脚注 B 再离开（或离开图区、空白处延时收起）时，
+  // A 的高亮会被 B 的 pointerleave / svg 的 pointerleave 一起抹掉。
+  function applySelection(){
+    if (pointerFoot) { cancelDark(); lightIds(footIds(pointerFoot)); return; }
+    if (hoverGroup) { cancelDark(); light(hoverGroup.k, hoverGroup.a); return; }
+    if (focusFoot) { cancelDark(); lightIds(footIds(focusFoot)); return; }
+    cancelDark(); dark();
+  }
+  // 指针停在空白处时的延迟收起：到点后同样走 applySelection，
+  // 有焦点脚注就退回它，而不是把整张图清空。
+  function scheduleDark(){ if (!pend) pend = setTimeout(function(){ pend = null; applySelection(); }, 80); }
+  function cancelDark(){ if (pend){ clearTimeout(pend); pend = null; } }
+  svg.addEventListener('pointerover', function(e){
+    // 两种钩子分开找：气泡/能力线带 data-k（同族同代次，粒度细），图例格只带 data-c（整厂）。
+    // 一个点两个属性都有 —— 所以先认 data-k，悬停单个档位亮它自己那一族，
+    // 悬停图例格才把这家全部档位抬起来。用两次单选择器而不是 '[data-k],[data-c]'：
+    // 语义一样，但假 DOM 桩的 closest 只解析单条选择器，写逗号就是在考桩子。
+    var t = e.target.closest ? (e.target.closest('[data-k]') || e.target.closest('[data-c]')) : null;
+    if (t) {
+      var a = 'data-k', k = t.getAttribute('data-k');
+      if (k === null) { a = 'data-c'; k = t.getAttribute('data-c'); }
+      hoverGroup = {a:a, k:k};
+      pointerFoot = null;          // 指针已进图区，脚注不再是指针态
+      cancelDark(); light(k, a);
+    }
+    // 掠过金色前沿、网格线这类"非组节点"时**延迟**收起：同组两档之间移动必然穿过它们，
+    // 立刻收起就会闪；停手 80ms 后确实还在空白处才收（有焦点脚注则退回它）。
+    else {
+      hoverGroup = null;
+      scheduleDark();
+    }
+  });
+  svg.addEventListener('pointerleave', function(){
+    // 离开图区不等于熄灯：键盘用户可能还聚焦在某个脚注上，指针只是路过。
+    hoverGroup = null;
+    applySelection();
+  });
+  // 脚注三个计数：悬停/聚焦时按 data-index 抬起精确子集；离开/失焦按优先级回退
+  // （指针 > 焦点 > 无），并按 dark() 还原 DOM 序、高亮与卡片几何。
+  // 气泡由作者侧写进 .bub（名字已转义），不依赖原生 title。
+  function footIds(el){
+    return String(el.getAttribute('data-index') || '').split(',').filter(function(s){ return s !== ''; });
+  }
+  [].forEach.call(document.querySelectorAll('[data-foot-group]'), function(el){
+    el.addEventListener('pointerenter', function(){
+      pointerFoot = el;
+      hoverGroup = null;           // 指针已到脚注上，图区悬停态结束
+      cancelDark(); lightIds(footIds(el));
+    });
+    el.addEventListener('pointerleave', function(){
+      if (pointerFoot === el) pointerFoot = null;
+      // 另一个脚注还有焦点就立即退回它（焦点不该被鼠标路过抹掉）；
+      // 没有焦点才走延迟收起，穿过脚注文字/气泡时不闪。
+      if (focusFoot || hoverGroup) applySelection(); else scheduleDark();
+    });
+    el.addEventListener('focus', function(){
+      focusFoot = el;
+      // 指针仍指在组上时指针优先：焦点只登记，不抢高亮。
+      if (pointerFoot || hoverGroup) return;
+      cancelDark(); lightIds(footIds(el));
+    });
+    el.addEventListener('blur', function(){
+      if (focusFoot === el) focusFoot = null;
+      // 焦点在脚注之间移动时会先 blur 再 focus：这里只排队，focus 会取消它。
+      if (pointerFoot || hoverGroup) applySelection(); else scheduleDark();
+    });
+    el.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') {
+        // Escape 是显式清场：清高亮、清焦点，并把三种选择态一起清掉，
+        // 防止随后的 blur 排队又把同一组点亮（cleanup no stale）。
+        cancelDark(); pointerFoot = null; hoverGroup = null; focusFoot = null;
+        dark(); el.blur();
+      }
+    });
+  });
+/* HOVER-END */
+  }
+
+  /* ---- 自动刷新：刷新后整页重载，省得再写一套增量 diff ---- */
+  // 触发时**现读** checked：原先只判"元素存在"（它永远在），取消勾选后照样每 60s 重载。
+  const autor = document.getElementById('autor');
+  if(autor && autor.checked){
+    setInterval(() => { if(autor.checked) location.reload(); }, 60000);
+  }
+
+  // 只给 verify_dashboard.mjs 的 DOM 桩导出真实函数；普通页面没有这个开关，
+  // 不增加运行时全局，也不走第二份复制实现。
+  if (window.__MR_HARNESS__) window.__mrTest = {
+    timeCell, timeSpanCell, thinkRatioOf, thinkRatioCell, taskTimeOf, taskUOf, taskAreaOf, taskScatR,
+    taskOfficialOf, taskEstOf, taskBandOf, taskKindOf, taskTextOf, taskNoteOf,
+    sizeFactorOf, penaltyFactorFor,
+    getSizeMode: () => sizeByTask ? 'task' : 'speed',
+    setSizeMode: applySizeMode,
+    getLowPenalty: () => !!lowPenaltyOn,
+    setLowPenalty: on => {
+      lowPenaltyOn = !!on;
+      syncPenaltyUI(); updateSizeCaption(); renderLegend(); renderScatter();
+    },
+    penaltyReady: () => PENALTY_READY,
+    renderScatter, renderLegend
+  };
+})();
+</script>
+</body>
+</html>

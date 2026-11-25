@@ -45,7 +45,7 @@ jobs:
         run: |
           previous="$RUNNER_TEMP/modelradar-previous.json"
           status=$(curl --silent --show-error --max-time 25 --retry 2 --output "$previous" --write-out '%{http_code}' \
-            "https://chr1sch4n-ops.github.io/modelradar/data/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+            "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/data/latest.json?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
           args=()
           case "$status" in
             200) args=(--carry-from "$previous") ;;

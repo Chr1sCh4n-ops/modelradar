@@ -1,8 +1,11 @@
-.state/
-.venv/
+# 仓库里的 data 是**真目录**：爬虫每次抓取把 latest.js 与 logos/ 镜像进来给沙箱
+# 浏览器读（~/Library 是 0700，浏览器不跟软链进去，见 README「目录布局」）。
+# 镜像全部可再生产物，不入库。
+data
 __pycache__/
-*.db
-*.db-shm
-*.db-wal
-data/latest.json
-data/logos_raw/
+*.pyc
+.DS_Store
+.venv/
+
+# 分发产物：几百 KB 的 dmg/zip 与解开的暂存区，不入库
+dist/
